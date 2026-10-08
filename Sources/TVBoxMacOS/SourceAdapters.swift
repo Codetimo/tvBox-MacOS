@@ -40,7 +40,7 @@ struct M3UAdapter: SourceAdapter {
                 let attrs = parseAttributes(parts.first ?? "")
                 let name = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : (attrs["tvg-name"] ?? "Unnamed")
                 pending = (name, attrs["group-title"] ?? "Uncategorized", attrs["tvg-logo"].flatMap(URL.init(string:)), [:])
-            } else if !line.hasPrefix("#"), let url = URL(string: line.trimmingCharacters(in: .whitespacesAndNewlines)), var item = pending {
+            } else if !line.hasPrefix("#"), let url = URL(string: line.trimmingCharacters(in: .whitespacesAndNewlines)), let item = pending {
                 channels.append(TVChannel(id: stableID(source: source, name: item.name, url: url), name: item.name, group: item.group, logoURL: item.logo, streamURL: url, headers: item.headers))
                 pending = nil
                 if channels.count >= maxChannels { break }
