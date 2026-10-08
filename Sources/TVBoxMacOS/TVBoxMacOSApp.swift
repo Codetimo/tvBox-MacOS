@@ -67,11 +67,17 @@ struct ChannelBrowserView: View {
                 VideoPlayer(player: player)
                     .frame(minWidth: 640, minHeight: 360)
             } else {
-                ContentUnavailableView(
-                    "选择频道",
-                    systemImage: "play.tv",
-                    description: Text("导入 M3U 或 TVBox JSON 后开始播放")
-                )
+                VStack(spacing: 12) {
+                    Image(systemName: "play.tv")
+                        .font(.system(size: 42))
+                    Text("选择频道")
+                        .font(.headline)
+                    Text("导入 M3U 或 TVBox JSON 后开始播放")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
