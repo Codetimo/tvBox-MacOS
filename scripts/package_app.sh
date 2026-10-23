@@ -26,6 +26,15 @@ mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BIN_PATH" "$APP_PATH/Contents/MacOS/TVBoxMacOS"
 # 资源保留仓库布局，setup/build/launcher 的相对路径在 App 内同样有效。
 RESOURCE_DIR="$APP_PATH/Contents/Resources"
+# 从选定原图生成 macOS 各尺寸图标；中间文件随打包临时目录一起清理。
+ICONSET_PATH="$STAGING_DIR/AppIcon.iconset"
+mkdir -p "$ICONSET_PATH"
+for ICON_SIZE in 16 32 128 256 512; do
+  sips -z "$ICON_SIZE" "$ICON_SIZE" "$PROJECT_DIR/Resources/AppIcon.png" --out "$ICONSET_PATH/icon_${ICON_SIZE}x${ICON_SIZE}.png" >/dev/null
+  RETINA_SIZE=$((ICON_SIZE * 2))
+  sips -z "$RETINA_SIZE" "$RETINA_SIZE" "$PROJECT_DIR/Resources/AppIcon.png" --out "$ICONSET_PATH/icon_${ICON_SIZE}x${ICON_SIZE}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET_PATH" -o "$RESOURCE_DIR/AppIcon.icns"
 mkdir -p "$RESOURCE_DIR/scripts/spider-service" "$RESOURCE_DIR/Bridge"
 cp "$PROJECT_DIR/scripts/setup_spider_runtime.sh" "$PROJECT_DIR/scripts/build_spider_bridge.sh" "$PROJECT_DIR/scripts/setup_media_runtime.sh" "$RESOURCE_DIR/scripts/"
 cp "$PROJECT_DIR/scripts/spider-service/launch.sh" "$RESOURCE_DIR/scripts/spider-service/"
@@ -51,6 +60,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
 <key>CFBundleVersion</key><string>1.0.3</string>
 <key>CFBundleShortVersionString</key><string>1.0.3</string>
 <key>CFBundleExecutable</key><string>TVBoxMacOS</string>
+<key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
