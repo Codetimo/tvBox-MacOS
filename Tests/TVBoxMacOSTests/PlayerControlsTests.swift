@@ -4,19 +4,18 @@ import XCTest
 @testable import TVBoxMacOS
 
 final class PlayerControlsTests: XCTestCase {
-    /// 验证真实 AppKit 控件与事件监听：全屏空闲隐藏，鼠标/键盘唤醒，普通窗口常驻。
+    /// 普通窗口挂载后自动启用隐藏，验证鼠标/键盘唤醒和重新计时。
     @MainActor
-    func testFullscreenControlsHideAndWakeForWindowInput() throws {
+    func testWindowedControlsAutomaticallyHideAndWakeForPlayerInput() throws {
         _ = NSApplication.shared
         let view = KeyboardPlayerView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
         view.configureControls(compatibility: false)
         let window = NSWindow(contentRect: view.bounds, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = view
-        defer { view.setFullscreenControlsAutoHide(false); window.close() }
+        defer { view.setControlsAutoHide(false); window.close() }
         let bar = try XCTUnwrap(view.subviews.compactMap { $0 as? NSStackView }.first)
 
-        view.setFullscreenControlsAutoHide(true)
         XCTAssertFalse(bar.isHidden)
         RunLoop.main.run(until: Date().addingTimeInterval(3.4))
         XCTAssertTrue(bar.isHidden)
@@ -40,14 +39,14 @@ final class PlayerControlsTests: XCTestCase {
             isARepeat: false, keyCode: 0))
         NSApp.sendEvent(key)
         XCTAssertFalse(bar.isHidden)
-        view.setFullscreenControlsAutoHide(false)
+        view.setControlsAutoHide(false)
         RunLoop.main.run(until: Date().addingTimeInterval(3.4))
-        XCTAssertFalse(bar.isHidden, "退出全屏后，普通窗口控制栏应保持显示")
+        XCTAssertFalse(bar.isHidden, "关闭监听后控制栏恢复可见，不再收到隐藏计时")
     }
 
-    /// 其他窗口的操作不能唤醒全屏控制栏；移除视图时恢复可见状态并清理监听。
+    /// 其他窗口的操作不能唤醒控制栏；移除视图时恢复可见状态并清理监听。
     @MainActor
-    func testFullscreenControlsIgnoreOtherWindowAndCleanUpOnDetach() throws {
+    func testControlsIgnoreOtherWindowAndCleanUpOnDetach() throws {
         _ = NSApplication.shared
         let view = KeyboardPlayerView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
         view.configureControls(compatibility: false)
@@ -58,7 +57,6 @@ final class PlayerControlsTests: XCTestCase {
         window.contentView = view
         defer { window.close(); other.close() }
         let bar = try XCTUnwrap(view.subviews.compactMap { $0 as? NSStackView }.first)
-        view.setFullscreenControlsAutoHide(true)
         RunLoop.main.run(until: Date().addingTimeInterval(3.4))
         XCTAssertTrue(bar.isHidden)
         let key = try XCTUnwrap(NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [], timestamp: 0,
@@ -67,6 +65,49 @@ final class PlayerControlsTests: XCTestCase {
         NSApp.sendEvent(key)
         XCTAssertTrue(bar.isHidden)
         view.removeFromSuperview()
+        XCTAssertFalse(bar.isHidden)
+    }
+
+    /// 小屏只响应播放区域与自身焦点，搜索等区域的输入不会唤醒控件。
+    @MainActor
+    func testWindowedControlsIgnoreInputOutsidePlayer() throws {
+        _ = NSApplication.shared
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        let view = KeyboardPlayerView(frame: NSRect(x: 100, y: 100, width: 800, height: 450))
+        container.addSubview(view)
+        let field = NSTextField(frame: NSRect(x: 100, y: 600, width: 400, height: 30))
+        container.addSubview(field)
+        let window = NSWindow(contentRect: container.bounds, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = container
+        defer { view.setControlsAutoHide(false); window.close() }
+        let bar = try XCTUnwrap(view.subviews.compactMap { $0 as? NSStackView }.first)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertTrue(bar.isHidden)
+
+        let outsideMouse = try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: NSPoint(x: 50, y: 650),
+            modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 0, pressure: 0))
+        NSApp.sendEvent(outsideMouse)
+        XCTAssertTrue(bar.isHidden)
+        // 文本框实际由窗口共享的 NSTextView 编辑器接收键盘；离屏测试直接设置该焦点。
+        let editor = try XCTUnwrap(window.fieldEditor(true, for: field))
+        XCTAssertTrue(window.makeFirstResponder(editor))
+        let key = try XCTUnwrap(NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "a", charactersIgnoringModifiers: "a",
+            isARepeat: false, keyCode: 0))
+        NSApp.sendEvent(key)
+        XCTAssertTrue(bar.isHidden)
+
+        XCTAssertTrue(window.makeFirstResponder(view))
+        NSApp.sendEvent(key)
+        XCTAssertFalse(bar.isHidden)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertTrue(bar.isHidden)
+        let insideMouse = try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: NSPoint(x: 500, y: 300),
+            modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 0, pressure: 0))
+        NSApp.sendEvent(insideMouse)
         XCTAssertFalse(bar.isHidden)
     }
 

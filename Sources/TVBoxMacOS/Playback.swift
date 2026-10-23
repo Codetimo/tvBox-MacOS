@@ -489,8 +489,8 @@ final class KeyboardPlayerView: AVPlayerView {
         if let controlsActivityMonitor { NSEvent.removeMonitor(controlsActivityMonitor) }
     }
 
-    /// 只监听本应用的全屏窗口；返回原事件，让按钮、滑块和快捷键继续正常处理。
-    func setFullscreenControlsAutoHide(_ enabled: Bool) {
+    /// 大小屏共用自动隐藏；只响应当前播放器的操作，并将原事件交还控件处理。
+    func setControlsAutoHide(_ enabled: Bool) {
         if let controlsActivityMonitor { NSEvent.removeMonitor(controlsActivityMonitor) }
         controlsActivityMonitor = nil
         showControlsForActivity()
@@ -501,8 +501,24 @@ final class KeyboardPlayerView: AVPlayerView {
             .otherMouseDown, .otherMouseUp, .leftMouseDragged, .rightMouseDragged,
             .otherMouseDragged, .scrollWheel, .keyDown, .keyUp, .flagsChanged
         ]) { [weak self] event in
-            if let self, event.window === self.window { self.showControlsForActivity() }
+            if let self, self.isControlsActivity(event) { self.showControlsForActivity() }
             return event
+        }
+    }
+
+    /// 小屏时忽略搜索框、选集等区域的操作，键盘只唤醒当前持有焦点的播放器。
+    private func isControlsActivity(_ event: NSEvent) -> Bool {
+        guard let window, event.window === window, !isHiddenOrHasHiddenAncestor else { return false }
+        switch event.type {
+        case .keyDown, .keyUp, .flagsChanged:
+            guard let responder = window.firstResponder as? NSView else { return false }
+            return responder === self || responder.isDescendant(of: self)
+        default:
+            // 拖动滑块超出画面时仍视为操作，避免拖动过程中或刚松手就隐藏。
+            if progressSlider?.isScrubbing == true || volumeSlider?.isScrubbing == true { return true }
+            let location = convert(event.locationInWindow, from: nil)
+            // 新版 AppKit 不裁剪子视图时，visibleRect 可能超出自身 bounds，需同时判断。
+            return bounds.contains(location) && visibleRect.contains(location)
         }
     }
 
@@ -512,7 +528,7 @@ final class KeyboardPlayerView: AVPlayerView {
         controlsBar?.isHidden = false
     }
 
-    /// 全屏空闲三秒后隐藏整组控件；按住滑块时持续保留，松开后重新计时。
+    /// 空闲三秒后隐藏整组控件；按住滑块时持续保留，松开后重新计时。
     private func updateControlsVisibility() {
         guard controlsActivityMonitor != nil else { return }
         if progressSlider?.isScrubbing == true || volumeSlider?.isScrubbing == true {
@@ -698,10 +714,8 @@ final class KeyboardPlayerView: AVPlayerView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         configureControls(compatibility: usesCompatibilityControls)
-        guard window != nil else {
-            setFullscreenControlsAutoHide(false)
-            return
-        }
+        setControlsAutoHide(window != nil)
+        guard window != nil else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.window?.firstResponder !== self {
@@ -756,6 +770,7 @@ final class KeyboardPlayerView: AVPlayerView {
             self.player = controller.playerView.player
             controller.playerView.player = nil
             self.fullscreenController = nil
+            self.showControlsForActivity()
             self.updateControls()
             self.window?.makeFirstResponder(self)
         }
@@ -829,12 +844,12 @@ final class FullscreenPlayerController: NSWindowController, NSWindowDelegate {
 
     /// 全屏动画完成后再开始空闲计时，确保初次进入时控件可见。
     func windowDidEnterFullScreen(_ notification: Notification) {
-        playerView.setFullscreenControlsAutoHide(true)
+        playerView.setControlsAutoHide(true)
     }
 
     /// 退出动画开始即恢复控件并移除窗口事件监听。
     func windowWillExitFullScreen(_ notification: Notification) {
-        playerView.setFullscreenControlsAutoHide(false)
+        playerView.setControlsAutoHide(false)
     }
 
     /// 系统全屏退出动画完成后回到原播放页。
@@ -845,7 +860,7 @@ final class FullscreenPlayerController: NSWindowController, NSWindowDelegate {
 
     /// 点击关闭按钮、Esc 和视图销毁共用同一清理路径。
     func windowWillClose(_ notification: Notification) {
-        playerView.setFullscreenControlsAutoHide(false)
+        playerView.setControlsAutoHide(false)
         let completion = onClose
         onClose = nil
         completion?()
