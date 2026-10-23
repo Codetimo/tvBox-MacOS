@@ -1,5 +1,7 @@
 # tvBox-MacOS
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A personal, local-first macOS player for user-provided IPTV/M3U and TVBox/影视仓 JSON sources.
 
 ## Current scope
