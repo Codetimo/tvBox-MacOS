@@ -415,8 +415,46 @@ final class KeyboardPlayerView: AVPlayerView {
     private var volumeSlider: PlayerTrackingSlider?
     private var muteButton: NSButton?
     private var timeLabel: NSTextField?
+    private var controlsActivityMonitor: Any?
+    private var lastControlsActivity = ProcessInfo.processInfo.systemUptime
 
-    deinit { controlsTimer?.invalidate() }
+    deinit {
+        controlsTimer?.invalidate()
+        if let controlsActivityMonitor { NSEvent.removeMonitor(controlsActivityMonitor) }
+    }
+
+    /// 只监听本应用的全屏窗口；返回原事件，让按钮、滑块和快捷键继续正常处理。
+    func setFullscreenControlsAutoHide(_ enabled: Bool) {
+        if let controlsActivityMonitor { NSEvent.removeMonitor(controlsActivityMonitor) }
+        controlsActivityMonitor = nil
+        showControlsForActivity()
+        guard enabled, let window else { return }
+        window.acceptsMouseMovedEvents = true
+        controlsActivityMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .mouseMoved, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp, .leftMouseDragged, .rightMouseDragged,
+            .otherMouseDragged, .scrollWheel, .keyDown, .keyUp, .flagsChanged
+        ]) { [weak self] event in
+            if let self, event.window === self.window { self.showControlsForActivity() }
+            return event
+        }
+    }
+
+    /// 使用单调时钟记录用户操作，播放进度刷新不会延长控制栏显示时间。
+    private func showControlsForActivity() {
+        lastControlsActivity = ProcessInfo.processInfo.systemUptime
+        controlsBar?.isHidden = false
+    }
+
+    /// 全屏空闲三秒后隐藏整组控件；按住滑块时持续保留，松开后重新计时。
+    private func updateControlsVisibility() {
+        guard controlsActivityMonitor != nil else { return }
+        if progressSlider?.isScrubbing == true || volumeSlider?.isScrubbing == true {
+            showControlsForActivity()
+        } else if ProcessInfo.processInfo.systemUptime - lastControlsActivity >= 3 {
+            controlsBar?.isHidden = true
+        }
+    }
 
     /// 普通和兼容播放共享底部控件，避免动态 HLS 时长触发系统浮动控件异常。
     func configureControls(compatibility: Bool) {
@@ -529,6 +567,7 @@ final class KeyboardPlayerView: AVPlayerView {
 
     /// 定时同步播放、缓存和音量状态，键盘与按钮操作共享同一个 AVPlayer。
     private func updateControls() {
+        updateControlsVisibility()
         guard let player else { return }
         playPauseButton?.image = NSImage(systemSymbolName: player.rate > 0 ? "pause.fill" : "play.fill", accessibilityDescription: player.rate > 0 ? "暂停" : "播放")
         let timeline = timelineState(for: player)
@@ -593,7 +632,10 @@ final class KeyboardPlayerView: AVPlayerView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         configureControls(compatibility: usesCompatibilityControls)
-        guard window != nil else { return }
+        guard window != nil else {
+            setFullscreenControlsAutoHide(false)
+            return
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.window?.firstResponder !== self {
@@ -719,6 +761,16 @@ final class FullscreenPlayerController: NSWindowController, NSWindowDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// 全屏动画完成后再开始空闲计时，确保初次进入时控件可见。
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        playerView.setFullscreenControlsAutoHide(true)
+    }
+
+    /// 退出动画开始即恢复控件并移除窗口事件监听。
+    func windowWillExitFullScreen(_ notification: Notification) {
+        playerView.setFullscreenControlsAutoHide(false)
+    }
+
     /// 系统全屏退出动画完成后回到原播放页。
     func windowDidExitFullScreen(_ notification: Notification) { close() }
 
@@ -727,6 +779,7 @@ final class FullscreenPlayerController: NSWindowController, NSWindowDelegate {
 
     /// 点击关闭按钮、Esc 和视图销毁共用同一清理路径。
     func windowWillClose(_ notification: Notification) {
+        playerView.setFullscreenControlsAutoHide(false)
         let completion = onClose
         onClose = nil
         completion?()

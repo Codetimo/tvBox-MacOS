@@ -19,7 +19,15 @@ Use Xcode 15+ on macOS. Run commands from the repository root:
 - `scripts/setup_media_runtime.sh`: download and verify FFmpeg for media integration tests.
 - `scripts/setup_spider_runtime.sh`: provision the Android/JDK runtime; the current setup targets Apple Silicon.
 - `scripts/build_spider_bridge.sh`: rebuild the APK after runtime setup.
-- `scripts/package_app.sh "$PWD/dist"`: build and ad-hoc sign the release app in `dist/`; omitting the argument installs into `~/Applications`.
+- `scripts/package_app.sh`: build, ad-hoc sign, and replace the single installed app at `~/Applications/TVBoxMacOS.app`. Custom output directories are not supported.
+
+## 本机打包规则
+
+- 用户明确要求：以后打包是替换，不再留存多份 APP。
+- 本机只保留 `~/Applications/TVBoxMacOS.app` 这一份最新可启动应用。不要在 `dist/`、日期发布目录或备份目录保留额外 `.app`。
+- 使用脚本的隐藏临时目录完成构建和签名，成功后替换固定路径，临时产物随脚本退出清理。不额外备份旧 APP。
+- 如需 ZIP，仅替换 `dist/TVBoxMacOS-macOS-arm64.zip` 及对应校验文件，不累积版本/日期命名的压缩包。
+- 打包完成后检查实际启动路径，避免打开旧构建；清理范围仅限已确认的本项目/旧影视仓构建产物，不删除源代码或用户配置。
 
 ## Coding Style & Naming Conventions
 

@@ -3,13 +3,22 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="TVBoxMacOS.app"
-INSTALL_DIR="${1:-$HOME/Applications}"
-APP_PATH="$INSTALL_DIR/$APP_NAME"
+INSTALL_DIR="$HOME/Applications"
+if [[ $# -gt 0 ]]; then
+  echo "Usage: scripts/package_app.sh (replaces $INSTALL_DIR/$APP_NAME; custom output directories are no longer supported)" >&2
+  exit 2
+fi
+FINAL_APP_PATH="$INSTALL_DIR/$APP_NAME"
 
 cd "$PROJECT_DIR"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)/TVBoxMacOS"
 
+# 在隐藏的临时目录完成构建和签名；失败时清理临时产物，保留已安装应用。
+mkdir -p "$INSTALL_DIR"
+STAGING_DIR="$(mktemp -d "$INSTALL_DIR/.tvbox-package.XXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+APP_PATH="$STAGING_DIR/$APP_NAME"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BIN_PATH" "$APP_PATH/Contents/MacOS/TVBoxMacOS"
 # 资源保留仓库布局，setup/build/launcher 的相对路径在 App 内同样有效。
@@ -45,4 +54,15 @@ cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --deep --sign - "$APP_PATH"
-echo "Installed: $APP_PATH"
+codesign --verify --deep --strict "$APP_PATH"
+# 本地只保留固定安装入口，不创建日期目录、dist APP 或备份 APP。
+if [[ -e "$FINAL_APP_PATH" || -L "$FINAL_APP_PATH" ]]; then
+  INSTALLED_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$FINAL_APP_PATH/Contents/Info.plist")"
+  if [[ -L "$FINAL_APP_PATH" || "$INSTALLED_ID" != "com.codetimo.tvbox-macos" ]]; then
+    echo "Refusing to replace unexpected app: $FINAL_APP_PATH" >&2
+    exit 1
+  fi
+  rm -rf "$FINAL_APP_PATH"
+fi
+mv "$APP_PATH" "$FINAL_APP_PATH"
+echo "Installed: $FINAL_APP_PATH"

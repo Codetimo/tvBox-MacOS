@@ -39,6 +39,18 @@ It is not bundled into the app, and credentials or signed URLs must not be commi
 - `Playback.swift`: AVPlayer seam
 - `TVBoxMacOSApp.swift`: SwiftUI shell
 
+## Packaging
+
+```bash
+scripts/package_app.sh
+codesign --verify --deep --strict "$HOME/Applications/TVBoxMacOS.app"
+```
+
+Packaging replaces the single app at `~/Applications/TVBoxMacOS.app`; custom output
+directories are no longer accepted. Temporary staging is cleaned up automatically.
+Do not retain additional `.app` copies in release or backup directories. If a ZIP is
+needed, replace `dist/TVBoxMacOS-macOS-arm64.zip` instead of creating dated copies.
+
 ## macOS playback compatibility
 
 The player page groups routes and episodes into adaptive, multiline buttons below

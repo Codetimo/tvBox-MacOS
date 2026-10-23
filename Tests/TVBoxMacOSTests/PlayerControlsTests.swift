@@ -4,6 +4,72 @@ import XCTest
 @testable import TVBoxMacOS
 
 final class PlayerControlsTests: XCTestCase {
+    /// 验证真实 AppKit 控件与事件监听：全屏空闲隐藏，鼠标/键盘唤醒，普通窗口常驻。
+    @MainActor
+    func testFullscreenControlsHideAndWakeForWindowInput() throws {
+        _ = NSApplication.shared
+        let view = KeyboardPlayerView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
+        view.configureControls(compatibility: false)
+        let window = NSWindow(contentRect: view.bounds, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { view.setFullscreenControlsAutoHide(false); window.close() }
+        let bar = try XCTUnwrap(view.subviews.compactMap { $0 as? NSStackView }.first)
+
+        view.setFullscreenControlsAutoHide(true)
+        XCTAssertFalse(bar.isHidden)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertTrue(bar.isHidden)
+        // SwiftUI 的时间轴/兼容模式同步不应唤醒已经隐藏的控制栏。
+        view.configureControls(compatibility: true)
+        XCTAssertTrue(bar.isHidden)
+
+        let mouse = try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0))
+        NSApp.sendEvent(mouse)
+        XCTAssertFalse(bar.isHidden)
+        RunLoop.main.run(until: Date().addingTimeInterval(1.7))
+        NSApp.sendEvent(mouse)
+        RunLoop.main.run(until: Date().addingTimeInterval(1.7))
+        XCTAssertFalse(bar.isHidden, "每次操作都应重新计算三秒空闲时间")
+        RunLoop.main.run(until: Date().addingTimeInterval(1.7))
+        XCTAssertTrue(bar.isHidden)
+
+        let key = try XCTUnwrap(NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "a", charactersIgnoringModifiers: "a",
+            isARepeat: false, keyCode: 0))
+        NSApp.sendEvent(key)
+        XCTAssertFalse(bar.isHidden)
+        view.setFullscreenControlsAutoHide(false)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertFalse(bar.isHidden, "退出全屏后，普通窗口控制栏应保持显示")
+    }
+
+    /// 其他窗口的操作不能唤醒全屏控制栏；移除视图时恢复可见状态并清理监听。
+    @MainActor
+    func testFullscreenControlsIgnoreOtherWindowAndCleanUpOnDetach() throws {
+        _ = NSApplication.shared
+        let view = KeyboardPlayerView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
+        view.configureControls(compatibility: false)
+        let window = NSWindow(contentRect: view.bounds, styleMask: [.titled], backing: .buffered, defer: false)
+        let other = NSWindow(contentRect: view.bounds, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        other.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.close(); other.close() }
+        let bar = try XCTUnwrap(view.subviews.compactMap { $0 as? NSStackView }.first)
+        view.setFullscreenControlsAutoHide(true)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertTrue(bar.isHidden)
+        let key = try XCTUnwrap(NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: other.windowNumber, context: nil, characters: "a", charactersIgnoringModifiers: "a",
+            isARepeat: false, keyCode: 0))
+        NSApp.sendEvent(key)
+        XCTAssertTrue(bar.isHidden)
+        view.removeFromSuperview()
+        XCTAssertFalse(bar.isHidden)
+    }
+
     /// 缩放离屏窗口后，进度、音量与操作按钮都应保持在播放器可视宽度内。
     @MainActor
     func testControlsRemainInsidePlayerAfterResize() {
