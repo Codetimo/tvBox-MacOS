@@ -27,28 +27,50 @@ struct SourceLoader {
         catalogCache.invalidate(url: url)
     }
 
-    /// 加载 TVBox JSON 中的影视站点配置，供搜索界面展示可搜索站点。
+    /// 使用保存过的源 UUID 作为命名空间，源名称和配置地址更新不会改变影片身份。
+    func loadCatalog(source: TVSource) async throws -> [TVBoxSite] {
+        try await namespacedCatalog(url: source.location, namespace: source.id.uuidString)
+    }
+
+    /// 独立 URL 调用保留兼容入口；应用源库调用应使用 loadCatalog(source:)。
     func loadCatalog(url: URL) async throws -> [TVBoxSite] {
+        try await namespacedCatalog(url: url, namespace: channelURLIdentity(url))
+    }
+
+    /// 缓存保存无所属源的解析结果，调用方命名空间只在返回时附加。
+    private func namespacedCatalog(url: URL, namespace: String) async throws -> [TVBoxSite] {
+        let catalog: [TVBoxSite]
         if let cached = Self.catalogCache.value(url: url, maxAge: Self.catalogCacheTTL) {
-            return cached
+            catalog = cached
+        } else {
+            let generation = Self.catalogCache.generation(url: url)
+            let data: Data
+            if url.isFileURL {
+                data = try Self.readLocalData(url)
+            } else {
+                guard ["http", "https"].contains(url.scheme?.lowercased()) else { throw SourceLoaderError.unsupportedURL }
+                let request = URLRequest(url: url, timeoutInterval: 20)
+                let (body, response) = try await BoundedResponseReader.read(request, session: session)
+                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
+                data = body
+            }
+            catalog = try TVBoxJSONAdapter().parseCatalog(data: data)
+            try Task.checkCancellation()
+            Self.catalogCache.store(catalog, url: url, generation: generation)
         }
-        if url.isFileURL {
-            let catalog = try TVBoxJSONAdapter().parseCatalog(data: Data(contentsOf: url, options: [.mappedIfSafe]))
-            Self.catalogCache.store(catalog, url: url)
-            return catalog
+        let counts = Dictionary(grouping: catalog, by: \.key).mapValues(\.count)
+        var seen = Set<String>()
+        return catalog.compactMap { site in
+            var scoped = site
+            scoped.sourceNamespace = namespace
+            // 非规范订阅重复使用 key 时仅对这些条目增加配置指纹，正常 key 可跨凭据轮换。
+            if counts[site.key, default: 0] > 1 { scoped.identityVariant = site.id }
+            return seen.insert(scoped.id).inserted ? scoped : nil
         }
-        guard ["http", "https"].contains(url.scheme?.lowercased()) else { throw SourceLoaderError.unsupportedURL }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 20
-        let (data, response) = try await session.data(for: request)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
-        let catalog = try TVBoxJSONAdapter().parseCatalog(data: data)
-        Self.catalogCache.store(catalog, url: url)
-        return catalog
     }
 
     /// 调用 CMS 搜索接口并解析为统一影片条目。
-    func search(site: TVBoxSite, keyword: String, spiderBaseURL: URL? = nil, spiderToken: String? = nil) async throws -> [TVMediaItem] {
+    func search(site: TVBoxSite, keyword: String, spiderBaseURL: URL? = nil, spiderToken: String? = nil, enrichDetails: Bool = true) async throws -> [TVMediaItem] {
         if site.api == nil {
             guard site.usesSpider else { return [] }
             return try await searchSpider(site: site, keyword: keyword, baseURL: spiderBaseURL, token: spiderToken)
@@ -59,17 +81,17 @@ struct SourceLoader {
         // 很多 CMS 会拒绝 URLSession 的默认身份，搜索请求使用浏览器兼容的请求头。
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json,text/plain,*/*", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await BoundedResponseReader.read(request, session: session)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
         let results = try TVBoxSearchParser.parse(data: data, site: site)
         // 部分 CMS 的搜索接口只返回影片摘要，播放地址需要再调用 ac=detail。
-        return await enrichPlaybackSources(results, site: site)
+        return enrichDetails ? await enrichPlaybackSources(results, site: site) : results
     }
 
     /// Spider 搜索仅加载摘要，用户选择影片时再请求详情，避免每次搜索拉取大量线路。
     private func searchSpider(site: TVBoxSite, keyword: String, baseURL: URL?, token: String?) async throws -> [TVMediaItem] {
         // quickSearch 只声明搜索模式，不代表 Spider 包与宿主兼容。
-        let data = try await spiderRequest("search", site: site, parameters: ["keyword": keyword, "quick": true], baseURL: baseURL, token: token)
+        let data = try await spiderRequest("search", site: site, parameters: ["keyword": keyword, "quick": site.quickSearch], baseURL: baseURL, token: token)
         return try TVBoxSearchParser.parse(data: data, site: site)
     }
 
@@ -79,19 +101,56 @@ struct SourceLoader {
             throw SourceParseError.invalidInput("该影片缺少 Spider 详情参数。")
         }
         let data = try await spiderRequest("detail", site: site, parameters: ["ids": [id]], baseURL: baseURL, token: token)
+        return try Self.parseSpiderDetail(data: data, item: item)
+    }
+
+    /// 校验详情身份并保留站点的业务错误，解析过程不依赖网络或本机登录凭据。
+    static func parseSpiderDetail(data: Data, item: TVMediaItem) throws -> TVMediaItem {
+        guard let site = item.spiderSite, let id = item.vodID, !id.isEmpty else {
+            throw SourceParseError.invalidInput("该影片缺少 Spider 详情参数。")
+        }
         // 详情接口有些实现会省略 vod_id，或把 ID 编码/改变大小写；单条请求时
         // 可用原影片名称做二次校验，避免把正确详情误判成“站点未返回”。
         let details = try TVBoxSearchParser.parse(data: data, site: site, fallbackName: item.name)
         guard let detail = TVBoxSearchParser.matchDetail(details, requestedID: id, requestedName: item.name) else {
+            if details.isEmpty, let message = TVBoxSearchParser.providerMessage(data: data) {
+                throw SourceParseError.invalidInput("站点提示：\(message)")
+            }
             throw SourceParseError.invalidInput("站点未返回所选影片的详情。")
         }
-        guard !detail.playSources.isEmpty else { throw SourceParseError.invalidInput("站点未返回可播放线路。") }
+        guard !detail.playSources.isEmpty else {
+            if let message = TVBoxSearchParser.providerMessage(data: data) {
+                throw SourceParseError.invalidInput("站点提示：\(message)")
+            }
+            throw SourceParseError.invalidInput("站点未返回可播放线路。")
+        }
         // 保留搜索条目的稳定 ID 和站点信息，避免 Spider 详情缺少 vod_id 时
         // 写回列表后无法再次定位或继续调用播放接口。
         return TVMediaItem(id: item.id, name: detail.name, detailURL: item.detailURL ?? detail.detailURL,
                            posterURL: detail.posterURL ?? item.posterURL, remark: detail.remark ?? item.remark,
                            playSources: detail.playSources, sourceName: item.sourceName, siteName: item.siteName,
-                           siteKey: item.siteKey, spiderSite: site, vodID: item.vodID)
+                           siteKey: item.siteKey, spiderSite: site, vodID: item.vodID,
+                           sourceNamespace: item.sourceNamespace, legacyID: item.legacyID)
+    }
+
+    /// 用户打开 CMS 摘要时再加载详情，避免搜索等待所有影片的详情请求。
+    func loadCMSDetail(item: TVMediaItem) async throws -> TVMediaItem {
+        guard item.siteKey != "public", let url = item.detailURL, let id = item.vodID else { return item }
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json,text/plain,*/*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await BoundedResponseReader.read(request, session: session)
+        guard (response as? HTTPURLResponse).map({ 200..<300 ~= $0.statusCode }) == true else { throw URLError(.badServerResponse) }
+        let site = TVBoxSite(key: item.siteKey, name: item.siteName, api: url)
+        let details = try TVBoxSearchParser.parse(data: data, site: site)
+        guard let found = details.first(where: { $0.vodID == id }), !found.playSources.isEmpty else {
+            throw SourceParseError.invalidInput("站点未返回所选影片的可播放详情，请重试或更换站点。")
+        }
+        var result = item
+        result.playSources = found.playSources
+        result.posterURL = found.posterURL ?? item.posterURL
+        result.remark = found.remark ?? item.remark
+        return result
     }
 
     /// 先让 Spider 解析播放 ID；只有 parse=0 的 HTTP 地址可直接交给 AVPlayer。
@@ -104,7 +163,15 @@ struct SourceLoader {
         guard let url = source.url, ["http", "https"].contains(url.scheme?.lowercased()) else {
             throw SourceParseError.invalidInput("站点没有提供可用的 HTTP 播放地址。")
         }
-        let isDirect = ["m3u8", "mp4", "mov", "ts", "mkv"].contains(url.pathExtension.lowercased())
+        let kind: MediaProbe.Kind
+        do { kind = try await MediaProbe.classify(url: url, headers: [:], session: session) }
+        catch {
+            try Task.checkCancellation()
+            // 某些 CDN 不支持 Range 探测，仍允许播放器发起正常请求。
+            kind = .unknown
+        }
+        // 明确 HTML 才打开网页；CMS 的无后缀媒体保留原生播放机会，公开目录仍以网页为后备。
+        let isDirect = kind == .media || (kind == .unknown && item.siteKey != "public")
         return ResolvedMediaPlayback(url: url, headers: [:], isDirect: isDirect)
     }
 
@@ -264,7 +331,7 @@ struct SourceLoader {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await BoundedResponseReader.read(request, session: session)
         } catch let error as URLError where [.networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
             throw SourceParseError.invalidInput("与本地 Spider 服务的连接中断，服务恢复后请重试；这不代表资源站或互联网断网。")
         } catch let error as URLError where error.code == .timedOut {
@@ -299,7 +366,7 @@ struct SourceLoader {
                         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
                         request.setValue("application/json,text/plain,*/*", forHTTPHeaderField: "Accept")
                         do {
-                            let (detailData, response) = try await self.session.data(for: request)
+                            let (detailData, response) = try await BoundedResponseReader.read(request, session: self.session)
                             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return (index, nil) }
                             let detail = try TVBoxSearchParser.parse(data: detailData, site: site)
                             guard let matched = detail.first(where: { $0.id == item.id }), !matched.playSources.isEmpty else { return (index, nil) }
@@ -322,37 +389,59 @@ struct SourceLoader {
         var request = URLRequest(url: components.url!)
         request.timeoutInterval = 20
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await BoundedResponseReader.read(request, session: session)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { throw URLError(.badServerResponse) }
         return try TVBoxSearchParser.parse360(data: data)
     }
 
     func load(url: URL) async throws -> SourceSnapshot {
+        try Task.checkCancellation()
         guard url.scheme == "http" || url.scheme == "https" else {
             throw SourceLoaderError.unsupportedURL
         }
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await BoundedResponseReader.read(request, session: session)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw URLError(.badServerResponse)
         }
         guard !data.isEmpty else { throw SourceLoaderError.emptyResponse }
 
         let snapshot = try parse(data: data, location: url, name: url.host ?? "Remote source")
+        try Task.checkCancellation()
         guard snapshot.source.kind == .tvboxJSON else { return snapshot }
-        return await expandLivePlaylists(in: snapshot)
+        let expanded = await expandLivePlaylists(in: snapshot)
+        try Task.checkCancellation()
+        return expanded
     }
 
     /// 读取本地 M3U/JSON 文件，方便个人源不必上传到公网。
-    func load(fileURL: URL) throws -> SourceSnapshot {
+    func load(fileURL: URL) async throws -> SourceSnapshot {
+        try Task.checkCancellation()
         guard fileURL.isFileURL else { throw SourceLoaderError.unsupportedURL }
-        let data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+        let data = try Self.readLocalData(fileURL)
         guard !data.isEmpty else { throw SourceLoaderError.emptyResponse }
-        return try parse(data: data, location: fileURL, name: fileURL.deletingPathExtension().lastPathComponent)
+        let snapshot = try parse(data: data, location: fileURL, name: fileURL.deletingPathExtension().lastPathComponent)
+        try Task.checkCancellation()
+        guard snapshot.source.kind == .tvboxJSON else { return snapshot }
+        let expanded = await expandLivePlaylists(in: snapshot)
+        try Task.checkCancellation()
+        return expanded
     }
 
+    /// 本地文件同样限制实际读取量，避免文件变化或错误导入大文件时分配完整内容。
+    private static func readLocalData(_ url: URL) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: BoundedResponseReader.maximumBytes + 1) ?? Data()
+        guard data.count <= BoundedResponseReader.maximumBytes else {
+            throw SourceParseError.invalidInput("源文件超过 10 MB 大小限制。")
+        }
+        return data
+    }
+
+    /// 解析入口仅处理格式；本地和远程调用均在解析后展开引用的直播列表。
     private func parse(data: Data, location: URL, name: String) throws -> SourceSnapshot {
         let firstNonWhitespace = data.drop { $0 == 0xEF || $0 == 0xBB || $0 == 0xBF || $0 == 0x20 || $0 == 0x09 || $0 == 0x0A || $0 == 0x0D }.first
         let extensionName = location.pathExtension.lowercased()
@@ -364,34 +453,105 @@ struct SourceLoader {
         }
     }
 
-    /// TVBox 的 lives.url 通常还是一个 M3U 播放列表，先展开它再交给播放器，避免把播放列表误当成视频地址。
-    private func expandLivePlaylists(in snapshot: SourceSnapshot) async -> SourceSnapshot {
+    /// 修复旧快照中的列表占位；保留已展开频道，仅处理已知失效镜像和 Android 内部代理。
+    func repairStoredLivePlaylists(in snapshot: SourceSnapshot) async -> SourceSnapshot? {
+        guard snapshot.channels.contains(where: LivePlaylistRecovery.needsStoredRepair) else { return nil }
+        let updated = await expandLivePlaylists(in: snapshot, repairOnly: true)
+        return Task.isCancelled ? nil : updated
+    }
+
+    /// TVBox lives.url 是频道列表时先展开；已失效的列表引用不得再伪装为可播放频道。
+    private func expandLivePlaylists(in snapshot: SourceSnapshot, repairOnly: Bool = false) async -> SourceSnapshot {
         var expanded: [TVChannel] = []
         var warnings = snapshot.warnings
         for channel in snapshot.channels {
+            if Task.isCancelled || (repairOnly && !LivePlaylistRecovery.needsStoredRepair(channel)) {
+                expanded.append(channel)
+                continue
+            }
+            if LivePlaylistRecovery.isAndroidProxy(channel.streamURL) {
+                warnings.append("直播列表「\(channel.name)」需要 Android TVBox 的本地代理，当前 macOS 未提供该接口。")
+                continue
+            }
+            let original = LivePlaylistRecovery.originalGitHubURL(channel.streamURL)
             do {
-                var request = URLRequest(url: channel.streamURL)
+                // 该镜像已经失效；仅解开 URL 明确携带的 GitHub 原始地址，仍使用正常 HTTPS 验证。
+                let playlistURL = original ?? channel.streamURL
+                var request = URLRequest(url: playlistURL)
                 request.timeoutInterval = 15
                 for (key, value) in channel.headers { request.setValue(value, forHTTPHeaderField: key) }
-                let (data, response) = try await session.data(for: request)
-                guard (response as? HTTPURLResponse).map({ 200..<300 ~= $0.statusCode }) ?? true else {
-                    throw URLError(.badServerResponse)
-                }
-                let text = String(data: data, encoding: .utf8) ?? ""
-                guard text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("#EXTM3U") else {
-                    expanded.append(channel)
+                guard let fetched = try await channelPlaylistData(request: request) else {
+                    expanded.append(TVChannel(id: channel.id, name: channel.name, group: channel.group, logoURL: channel.logoURL,
+                                              streamURL: playlistURL, headers: channel.headers))
                     continue
                 }
-                let nested = try M3UAdapter().parse(data: data, source: snapshot.source)
-                expanded.append(contentsOf: nested.channels)
+                let data = fetched.data
+                if M3UAdapter.isChannelPlaylist(data: data) {
+                    let nested = try M3UAdapter().parse(data: data, source: snapshot.source, playlistURL: fetched.url)
+                    expanded.append(contentsOf: nested.channels.map { child in
+                        TVChannel(id: child.id, name: child.name, group: child.group, logoURL: child.logoURL,
+                                  streamURL: child.streamURL, headers: channel.headers.merging(child.headers) { _, child in child })
+                    })
+                } else if LivePlaylistRecovery.isTextPlaylist(data) {
+                    expanded.append(contentsOf: try LivePlaylistRecovery.parseText(data, source: snapshot.source, headers: channel.headers))
+                } else if original != nil && !M3UAdapter.isHLSPlaylist(data: data) {
+                    throw SourceParseError.invalidInput("原始仓库未返回可识别的直播频道列表。")
+                } else {
+                    expanded.append(TVChannel(id: channel.id, name: channel.name, group: channel.group, logoURL: channel.logoURL,
+                                              streamURL: original == nil ? channel.streamURL : fetched.url, headers: channel.headers))
+                }
+                if original != nil {
+                    warnings.append("直播列表「\(channel.name)」的镜像不可用，已从其指定的 GitHub 原始仓库读取。")
+                }
             } catch {
-                // 单个直播组不可用时保留原地址，用户仍可尝试直接播放，并在界面提示。
-                expanded.append(channel)
-                warnings.append("直播源 \(channel.name) 展开失败：\(error.localizedDescription)")
+                if original == nil {
+                    // 未确认是频道列表的普通地址仍保留，避免一次网络波动删除真实频道。
+                    expanded.append(channel)
+                }
+                let reason = (error as? SourceParseError)?.localizedDescription ?? "网络或上游资源不可用（错误码 \((error as NSError).code)）"
+                warnings.append("直播列表「\(channel.name)」加载失败：\(reason)")
             }
         }
-        return SourceSnapshot(source: snapshot.source, channels: deduplicatedChannels(expanded), fetchedAt: snapshot.fetchedAt, parserVersion: "tvbox-json-2", warnings: warnings)
+        return SourceSnapshot(source: snapshot.source, channels: deduplicatedChannels(expanded), fetchedAt: snapshot.fetchedAt,
+                              parserVersion: "tvbox-json-3", warnings: Array(Set(warnings)).sorted())
     }
+    /// 直播地址可能是无限流；只在确认频道列表后继续读取，并限制总大小和耗时。
+    private func channelPlaylistData(request: URLRequest) async throws -> (data: Data, url: URL)? {
+        let (data, response) = try await BoundedResponseReader.read(
+            request, session: session, timeout: 15, prefixCheckpoints: [512, 4096]
+        ) { data, response in
+            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else { return true }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+            if contentType.hasPrefix("video/") || contentType.hasPrefix("audio/") && !contentType.contains("mpegurl") { return true }
+            guard !data.isEmpty else { return false }
+            let prefix = playlistPrefix(data).trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\u{feff}"))
+            if !prefix.uppercased().hasPrefix("#EXTM3U") && !LivePlaylistRecovery.isTextPlaylist(Data(prefix.utf8)) { return true }
+            return M3UAdapter.isHLSPlaylist(data: Data(prefix.utf8))
+        }
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard 200..<300 ~= http.statusCode else {
+            throw SourceParseError.invalidInput("上游返回 HTTP \(http.statusCode)。")
+        }
+        let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        if contentType.hasPrefix("video/") || contentType.hasPrefix("audio/") && !contentType.contains("mpegurl") { return nil }
+        return (data, response.url ?? request.url!)
+    }
+
+    /// 前缀可能截在多字节字符中间；只用 BOM 选择 UTF-16，末尾残缺字符允许替换解码。
+    private func playlistPrefix(_ data: Data) -> String {
+        let bytes = Array(data)
+        if bytes.starts(with: [0xff, 0xfe]) || bytes.starts(with: [0xfe, 0xff]) {
+            let littleEndian = bytes[0] == 0xff
+            let units = stride(from: 2, to: bytes.count - 1, by: 2).map { index in
+                littleEndian ? UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8
+                    : UInt16(bytes[index]) << 8 | UInt16(bytes[index + 1])
+            }
+            return String(decoding: units, as: UTF16.self)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
 }
 
 private final class CatalogCache {
@@ -401,8 +561,10 @@ private final class CatalogCache {
     }
 
     private var entries: [String: Entry] = [:]
+    private var generations: [String: UInt64] = [:]
     private let lock = NSLock()
 
+    /// 返回尚未过期的缓存目录。
     func value(url: URL, maxAge: TimeInterval) -> [TVBoxSite]? {
         let key = url.absoluteString
         lock.lock()
@@ -415,14 +577,25 @@ private final class CatalogCache {
         return entry.catalog
     }
 
-    func store(_ catalog: [TVBoxSite], url: URL) {
+    /// 记录开始读取时的版本，失效后的旧请求不能回填缓存。
+    func generation(url: URL) -> UInt64 {
         lock.lock()
-        entries[url.absoluteString] = Entry(catalog: catalog, storedAt: .now)
-        lock.unlock()
+        defer { lock.unlock() }
+        return generations[url.absoluteString, default: 0]
     }
 
+    /// 只有读取期间未失效才提交缓存，类似数据库乐观锁。
+    func store(_ catalog: [TVBoxSite], url: URL, generation: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generations[url.absoluteString, default: 0] == generation else { return }
+        entries[url.absoluteString] = Entry(catalog: catalog, storedAt: .now)
+    }
+
+    /// 增加版本并清除旧值，防止正在下载的旧目录恢复已失效状态。
     func invalidate(url: URL) {
         lock.lock()
+        generations[url.absoluteString, default: 0] &+= 1
         entries.removeValue(forKey: url.absoluteString)
         lock.unlock()
     }

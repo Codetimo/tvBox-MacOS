@@ -19,17 +19,51 @@ struct M3UAdapter: SourceAdapter {
     let maxBytes = 10 * 1024 * 1024
     let maxChannels = 20_000
 
+    /// HLS 主清单和媒体清单均包含 EXT-X 标签，不能作为 IPTV 频道列表展开。
+    static func isHLSPlaylist(data: Data) -> Bool {
+        let lines = playlistLines(data: data)
+        return lines.first?.uppercased().hasPrefix("#EXTM3U") == true
+            && lines.contains { $0.uppercased().hasPrefix("#EXT-X-") }
+    }
+
+    /// 仅展开带扩展 M3U 文件头、且不包含 HLS 标签的频道列表。
+    static func isChannelPlaylist(data: Data) -> Bool {
+        let lines = playlistLines(data: data)
+        return lines.first?.uppercased().hasPrefix("#EXTM3U") == true
+            && !lines.contains { $0.uppercased().hasPrefix("#EXT-X-") }
+    }
+
+    /// 统一处理 UTF-8/UTF-16、BOM 和行首空白，供分类及解析共用。
+    private static func playlistLines(data: Data) -> [String] {
+        guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return [] }
+        return text.split(whereSeparator: \.isNewline).map {
+            String(String($0).trimmingCharacters(in: .whitespacesAndNewlines).trimmingPrefix("\u{feff}"))
+        }.filter { !$0.isEmpty }
+    }
+
     func parse(data: Data, source: TVSource) throws -> SourceSnapshot {
+        try parse(data: data, source: source, playlistURL: source.location)
+    }
+
+    /// 嵌套列表的相对地址以最终列表 URL 为基准，频道身份仍归属用户导入的顶层源。
+    func parse(data: Data, source: TVSource, playlistURL: URL) throws -> SourceSnapshot {
         guard data.count <= maxBytes else {
             throw SourceParseError.invalidInput("M3U source exceeds the 10 MB safety limit.")
         }
-        guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else {
+        guard String(data: data, encoding: .utf8) != nil || String(data: data, encoding: .utf16) != nil else {
             throw SourceParseError.invalidInput("M3U source is not valid UTF-8/UTF-16 text.")
         }
 
-        let lines = text.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).trimmingPrefix("\u{feff}") }
+        let lines = Self.playlistLines(data: data)
         guard lines.first?.uppercased().hasPrefix("#EXTM3U") == true else {
             throw SourceParseError.invalidInput("Expected an extended M3U header.")
+        }
+
+        if Self.isHLSPlaylist(data: data) {
+            let channel = TVChannel(id: stableChannelID(source: source, name: source.name, url: playlistURL),
+                                    name: source.name, group: "Live", logoURL: nil,
+                                    streamURL: playlistURL, headers: [:])
+            return SourceSnapshot(source: source, channels: [channel], fetchedAt: .now, parserVersion: "m3u-3", warnings: [])
         }
 
         var channels: [TVChannel] = []
@@ -43,8 +77,12 @@ struct M3UAdapter: SourceAdapter {
                 if let userAgent = attrs["http-user-agent"] { headers["User-Agent"] = userAgent }
                 if let referrer = attrs["http-referrer"] { headers["Referer"] = referrer }
                 pending = (name, attrs["group-title"] ?? "Uncategorized", attrs["tvg-logo"].flatMap(URL.init(string:)), headers)
-            } else if !line.hasPrefix("#"), let url = URL(string: String(line)), ["http", "https"].contains(url.scheme?.lowercased()), let item = pending {
-                channels.append(TVChannel(id: stableID(source: source, name: item.name, url: url), name: item.name, group: item.group, logoURL: item.logo, streamURL: url, headers: item.headers))
+            } else if line.lowercased().hasPrefix("#extvlcopt:http-user-agent="), pending != nil {
+                pending?.headers["User-Agent"] = String(line.dropFirst("#EXTVLCOPT:http-user-agent=".count))
+            } else if line.lowercased().hasPrefix("#extvlcopt:http-referrer="), pending != nil {
+                pending?.headers["Referer"] = String(line.dropFirst("#EXTVLCOPT:http-referrer=".count))
+            } else if !line.hasPrefix("#"), let url = URL(string: String(line), relativeTo: playlistURL)?.absoluteURL, ["http", "https"].contains(url.scheme?.lowercased()), let item = pending {
+                channels.append(TVChannel(id: stableChannelID(source: source, name: item.name, url: url), name: item.name, group: item.group, logoURL: item.logo, streamURL: url, headers: item.headers))
                 pending = nil
                 if channels.count >= maxChannels { break }
             }
@@ -129,7 +167,7 @@ struct TVBoxJSONAdapter: SourceAdapter {
                 let name = live.name ?? raw
                 var headers: [String: String] = [:]
                 if let userAgent = live.ua, !userAgent.isEmpty { headers["User-Agent"] = userAgent }
-                channels.append(TVChannel(id: stableID(source: source, name: name, url: url), name: name, group: "Live", logoURL: nil, streamURL: url, headers: headers))
+                channels.append(TVChannel(id: stableChannelID(source: source, name: name, url: url), name: name, group: "Live", logoURL: nil, streamURL: url, headers: headers))
             }
         }
         let uniqueChannels = deduplicatedChannels(channels)
@@ -234,11 +272,12 @@ enum TVBoxSearchParser {
                 }
             }
             let vodID = item.vodID ?? name
-            return TVMediaItem(id: "\(site.api?.absoluteString ?? site.spiderURL?.absoluteString ?? site.adapter ?? "unknown")|\(site.key)|\(vodID)", name: name,
+            return TVMediaItem(id: "\(site.id)|\(vodID)", name: name,
                                detailURL: TVBoxSearchParser.makeDetailURL(site: site, id: item.vodID ?? ""),
                                posterURL: item.pic.flatMap(URL.init(string:)), remark: item.remark,
                                playSources: playSources,
-                               sourceName: site.name, siteName: site.name, siteKey: site.key, spiderSite: site.usesSpider ? site : nil, vodID: item.vodID)
+                               sourceName: site.name, siteName: site.name, siteKey: site.key, spiderSite: site.usesSpider ? site : nil, vodID: item.vodID,
+                               sourceNamespace: site.sourceNamespace, legacyID: site.legacyMediaID(vodID: vodID))
         }
     }
 
@@ -263,6 +302,28 @@ enum TVBoxSearchParser {
         return nil
     }
 
+    /// 详情为空或无线路时保留提供商的业务失败原因；HTTP 200 不代表业务成功。
+    static func providerMessage(data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return providerMessage(in: root, depth: 0)
+    }
+
+    /// 优先读取实际数据层，避免外层的通用成功提示覆盖登录、失效链接等原因。
+    private static func providerMessage(in value: Any, depth: Int) -> String? {
+        guard depth < 5, let object = value as? [String: Any] else { return nil }
+        for key in ["data", "result", "payload"] {
+            if let nested = object[key], let message = providerMessage(in: nested, depth: depth + 1) { return message }
+        }
+        for key in ["msg", "message", "error"] {
+            guard let raw = object[key] as? String else { continue }
+            let message = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !message.isEmpty, !["ok", "success", "成功", "操作成功", "请求成功"].contains(message.lowercased()) {
+                return message
+            }
+        }
+        return nil
+    }
+
     /// 对 Spider 返回的 ID 做宽松匹配，兼容 URL 编码和大小写差异。
     static func normalizedIdentifier(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -273,13 +334,14 @@ enum TVBoxSearchParser {
     static func matchDetail(_ details: [TVMediaItem], requestedID: String, requestedName: String) -> TVMediaItem? {
         let normalizedID = normalizedIdentifier(requestedID)
         if let exact = details.first(where: { detail in
-            guard let detailID = detail.vodID else { return false }
+            guard !normalizedID.isEmpty, let detailID = detail.vodID else { return false }
             return normalizedIdentifier(detailID) == normalizedID
         }) { return exact }
         let normalizedName = normalizedTitle(requestedName)
-        if let byName = details.first(where: { normalizedTitle($0.name) == normalizedName }) { return byName }
-        // ids 查询应只返回所请求影片；即使站点省略 vod_id/名称，也保留唯一结果。
-        return details.count == 1 ? details[0] : nil
+        let withoutID = details.filter { normalizedIdentifier($0.vodID ?? "").isEmpty }
+        if !normalizedName.isEmpty, let byName = withoutID.first(where: { normalizedTitle($0.name) == normalizedName }) { return byName }
+        // 只有确实省略 ID 的唯一详情允许展示名变化；明确冲突的 ID 不能退化为名称匹配。
+        return details.count == 1 && withoutID.count == 1 ? withoutID[0] : nil
     }
 
     private static func normalizedTitle(_ value: String) -> String {
@@ -318,10 +380,6 @@ private extension KeyedDecodingContainer {
         if let value = try? decode(Double.self, forKey: key) { return String(value) }
         return nil
     }
-}
-
-private func stableID(source: TVSource, name: String, url: URL) -> String {
-    "\(source.id.uuidString)|\(name)|\(url.absoluteString)"
 }
 
 /// ext 可以是字符串或 JSON 对象；传给 Spider.init 时保持它的原始语义。

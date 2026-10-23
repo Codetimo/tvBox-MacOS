@@ -125,9 +125,39 @@ final class PlaybackSeekTests: XCTestCase {
         XCTAssertEqual(coordinator.timelineOffset, 0)
     }
 
+    /// 长 GOP + B 帧 + AAC 在非关键帧目标也要落到准确原片位置，不能把前关键帧冒充目标。
+    @MainActor
+    func testNonKeyframeSeekWithAudioUsesOriginalTimeline() async throws {
+        let fixture = try await makeFixture(withAudio: true)
+        defer { fixture.server.stop(); try? FileManager.default.removeItem(at: fixture.folder) }
+        let coordinator = PlaybackCoordinator()
+        defer { coordinator.stop() }
+        coordinator.play(fixture.channel)
+        try await waitUntil { coordinator.player?.currentItem?.status == .readyToPlay }
+        let player = try XCTUnwrap(coordinator.player)
+        player.pause()
+        coordinator.seek(to: 63.3)
+        try await waitUntil {
+            coordinator.timelineOffset > 59 && player.currentItem?.status == .readyToPlay &&
+                abs(player.currentTime().seconds + coordinator.timelineOffset - 63.3) < 0.1
+        }
+        // 12 fps/B 帧 fixture 的最早音频 PTS 位于视频关键帧之前，两个轨道必须统一减该偏移。
+        XCTAssertEqual(coordinator.timelineOffset, 59.839, accuracy: 0.03)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        player.currentItem?.add(output)
+        try await waitUntil { output.hasNewPixelBuffer(forItemTime: player.currentTime()) }
+        XCTAssertNotNil(output.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil))
+        XCTAssertEqual(player.currentTime().seconds + coordinator.timelineOffset, 63.3, accuracy: 0.1)
+        XCTAssertEqual(player.rate, 0)
+        coordinator.seek(to: 65.1)
+        coordinator.seek(by: 1.2)
+        try await waitUntil { abs(player.currentTime().seconds + coordinator.timelineOffset - 66.3) < 0.1 }
+        XCTAssertNil(coordinator.errorMessage)
+    }
+
     /// 生成长于初始缓存窗口的本地 MKV，以真实 HTTP Range 和 FFmpeg 验证跨缓存跳转。
     @MainActor
-    private func makeFixture() async throws -> (folder: URL, server: LocalMediaHTTPServer, channel: TVChannel) {
+    private func makeFixture(withAudio: Bool = false) async throws -> (folder: URL, server: LocalMediaHTTPServer, channel: TVChannel) {
         let executable = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TVBoxMacOS/runtime/media/ffmpeg")
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
@@ -139,9 +169,11 @@ final class PlaybackSeekTests: XCTestCase {
         do {
             let generator = Process()
             generator.executableURL = executable
+            let audioInput = withAudio ? ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"] : []
             generator.arguments = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                "color=c=blue:s=160x90:r=12", "-t", "96", "-c:v", "libx264", "-preset", "ultrafast",
-                "-g", "12", "-bf", "0", "-f", "matroska", folder.appendingPathComponent("init.mp4").path]
+                "testsrc2=s=160x90:r=12"] + audioInput + ["-t", "96", "-c:v", "libx264", "-preset", "ultrafast",
+                "-g", withAudio ? "120" : "12", "-sc_threshold", "0", "-bf", withAudio ? "3" : "0",
+                "-c:a", "aac", "-f", "matroska", folder.appendingPathComponent("init.mp4").path]
             generator.standardError = FileHandle.nullDevice
             try generator.run()
             generator.waitUntilExit()

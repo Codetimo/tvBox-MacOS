@@ -31,14 +31,32 @@ final class SpiderService: ObservableObject {
     private var setupProcess: Process?
     private var generation = UUID()
     private var monitorTask: Task<Void, Never>?
+    private var startupTask: Task<Void, Never>?
+    private var startupID = UUID()
+    private let session: URLSession
+    private let monitorInterval: UInt64
 
-    init(port: Int = 19190) {
+    init(port: Int = 19190, session: URLSession = .shared, monitorInterval: UInt64 = 2_000_000_000) {
         self.port = port
         self.baseURL = URL(string: "http://127.0.0.1:\(port)")!
         self.token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        self.session = session
+        self.monitorInterval = monitorInterval
     }
 
     var isReady: Bool { state == .ready }
+
+    /// 所有业务请求共用就绪检查；取消单个调用者不会取消其他窗口的共享启动任务。
+    func ensureReady() async throws {
+        try Task.checkCancellation()
+        await start()
+        try Task.checkCancellation()
+        guard await waitUntilReady() else {
+            try Task.checkCancellation()
+            throw SourceParseError.invalidInput(state.message)
+        }
+        try Task.checkCancellation()
+    }
 
     /// 播放前建立媒体通道；adb 会在本服务的模拟器退出时移除对应转发。
     func preparePlaybackURL(_ url: URL) async throws -> URL {
@@ -72,21 +90,47 @@ final class SpiderService: ObservableObject {
         return isReady
     }
 
-    /// 启动 launcher 并等待服务；generation 防止停止后旧异步任务重新启动服务。
+    /// 各窗口共用独立启动任务；搜索等待被取消不会终止其他窗口正在使用的服务。
     func start() async {
-        guard process == nil, setupProcess == nil, state != .starting else { return }
+        if startupTask != nil { await waitForStartup(identifier: startupID); return }
+        let identifier = UUID()
+        startupID = identifier
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await performStart()
+            if startupID == identifier { startupTask = nil }
+        }
+        startupTask = task
+        await waitForStartup(identifier: identifier)
+    }
+
+    /// 等待者可单独取消，避免旧搜索在共享服务漫长的首次启动期间无法退出。
+    private func waitForStartup(identifier: UUID) async {
+        while startupID == identifier, startupTask != nil {
+            do { try await Task.sleep(nanoseconds: 50_000_000) }
+            catch { return }
+        }
+    }
+
+    /// 启动 launcher 并等待服务；generation 防止停止后旧异步任务重新启动服务。
+    private func performStart() async {
+        guard process == nil, setupProcess == nil, monitorTask == nil, state != .starting else { return }
         let attempt = UUID()
         generation = attempt
+        // MainActor 会在 await 期间允许其他调用进入，必须先占用启动状态。
+        state = .starting
 
         // App 重载或 launcher 被外部重启时，端口上的桥接服务可能已经就绪，
         // 这时直接复用现有服务，避免再次准备运行时和启动 Android 模拟器。
-        if await healthCheck() {
-            guard generation == attempt, !Task.isCancelled else { return }
+        let alreadyHealthy = await healthCheck()
+        guard generation == attempt else { return }
+        guard !Task.isCancelled else { stop(); return }
+        if alreadyHealthy {
             state = .ready
+            startMonitoring(attempt: attempt)
             return
         }
 
-        state = .starting
         if !runtimeIsPrepared() {
             guard let setup = scriptURL("setup_spider_runtime.sh") else {
                 state = .unavailable("未找到 Android 运行时准备脚本，请重新安装 App。")
@@ -100,7 +144,8 @@ final class SpiderService: ObservableObject {
                 return
             }
         }
-        guard generation == attempt, !Task.isCancelled else { stop(); return }
+        guard generation == attempt else { return }
+        guard !Task.isCancelled else { stop(); return }
         guard let launcher = scriptURL("spider-service/launch.sh") else {
             state = .unavailable("未找到 Spider 启动脚本，请重新安装 App。")
             return
@@ -121,6 +166,8 @@ final class SpiderService: ObservableObject {
                 guard let self else { return }
                 if self.process === terminated { self.process = nil }
                 guard self.generation == attempt else { return }
+                self.monitorTask?.cancel()
+                self.monitorTask = nil
                 self.state = .failed("Spider 服务已退出（状态码 \(terminated.terminationStatus)），日志：\(self.runtimeURL.appendingPathComponent("logs").path)")
             }
         }
@@ -143,7 +190,11 @@ final class SpiderService: ObservableObject {
             guard generation == attempt else { return }
             if healthy { state = .ready; startMonitoring(attempt: attempt); return }
             do { try await Task.sleep(nanoseconds: 500_000_000) }
-            catch { stop(); return }
+            catch {
+                // 旧启动任务的取消可能晚于新会话创建，只允许它停止自己的 generation。
+                if generation == attempt { stop() }
+                return
+            }
         }
         state = .failed("Spider 服务启动超时，日志：\(runtimeURL.appendingPathComponent("logs").path)")
         stop()
@@ -152,6 +203,9 @@ final class SpiderService: ObservableObject {
     /// 停止准备任务和 launcher；失败状态保留，清理由 launcher 的退出处理完成。
     func stop() {
         generation = UUID()
+        startupID = UUID()
+        startupTask?.cancel()
+        startupTask = nil
         monitorTask?.cancel()
         monitorTask = nil
         if let setupProcess, setupProcess.isRunning { setupProcess.terminate() }
@@ -166,11 +220,14 @@ final class SpiderService: ObservableObject {
         monitorTask?.cancel()
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 2_000_000_000) }
+                guard let interval = self?.monitorInterval else { return }
+                do { try await Task.sleep(nanoseconds: interval) }
                 catch { return }
-                guard let self, self.generation == attempt, self.process?.isRunning == true else { return }
+                guard let self, self.generation == attempt else { return }
+                if let process = self.process, !process.isRunning { return }
                 let healthy = await self.healthCheck()
-                guard self.generation == attempt, !Task.isCancelled, self.process?.isRunning == true else { return }
+                guard self.generation == attempt, !Task.isCancelled else { return }
+                if let process = self.process, !process.isRunning { return }
                 self.state = healthy ? .ready : .recovering
             }
         }
@@ -181,7 +238,7 @@ final class SpiderService: ObservableObject {
         var request = URLRequest(url: baseURL.appendingPathComponent("health"))
         request.timeoutInterval = 1.5
         request.setValue(token, forHTTPHeaderField: "X-TVBox-Token")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (object["ready"] as? Bool) == true else { return false }

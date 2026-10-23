@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct TVSource: Identifiable, Codable, Hashable {
     let id: UUID
@@ -32,7 +33,25 @@ struct TVChannel: Identifiable, Codable, Hashable {
 
 /// TVBox 站点配置。站点 API 通常兼容 /api.php/provide/vod/?wd=关键词 查询约定。
 struct TVBoxSite: Identifiable, Codable, Hashable {
-    var id: String { key }
+    /// 同一订阅的唯一 key 跨 API、包版本和凭据轮换保持身份；重复 key 才使用配置指纹。
+    var id: String {
+        let parts = sourceNamespace.map { [$0, key, identityVariant ?? ""] }
+            ?? [key, api?.absoluteString ?? "", adapter ?? "", spiderURL?.absoluteString ?? "", spiderExt ?? ""]
+        return "site-v2|" + Self.identityDigest(parts)
+    }
+    var sourceNamespace: String? = nil
+    var identityVariant: String? = nil
+
+    /// 长度编码避免分隔符歧义，摘要避免将 ext 中的凭据写进可见 ID。
+    static func identityDigest(_ parts: [String]) -> String {
+        let input = parts.map { "\($0.utf8.count):\($0)" }.joined()
+        return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 旧版影片 ID，仅用于严格受限的收藏迁移。
+    func legacyMediaID(vodID: String) -> String {
+        "\(api?.absoluteString ?? spiderURL?.absoluteString ?? adapter ?? "unknown")|\(key)|\(vodID)"
+    }
     let key: String
     let name: String
     let api: URL?
@@ -54,7 +73,7 @@ struct TVBoxSite: Identifiable, Codable, Hashable {
         self.spiderExt = spiderExt
     }
 
-    private enum CodingKeys: String, CodingKey { case key, name, api, adapter, searchable, quickSearch, spiderURL, spiderMD5, spiderExt }
+    private enum CodingKeys: String, CodingKey { case key, name, api, adapter, searchable, quickSearch, spiderURL, spiderMD5, spiderExt, sourceNamespace, identityVariant }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         key = try container.decode(String.self, forKey: .key)
@@ -66,6 +85,8 @@ struct TVBoxSite: Identifiable, Codable, Hashable {
         spiderURL = try container.decodeIfPresent(URL.self, forKey: .spiderURL)
         spiderMD5 = try container.decodeIfPresent(String.self, forKey: .spiderMD5)
         spiderExt = try container.decodeIfPresent(String.self, forKey: .spiderExt)
+        sourceNamespace = try container.decodeIfPresent(String.self, forKey: .sourceNamespace)
+        identityVariant = try container.decodeIfPresent(String.self, forKey: .identityVariant)
     }
 }
 
@@ -83,10 +104,12 @@ struct TVMediaItem: Identifiable, Codable, Hashable {
     var siteKey: String
     var spiderSite: TVBoxSite?
     var vodID: String?
+    var sourceNamespace: String?
+    var legacyID: String?
 
     init(id: String, name: String, detailURL: URL? = nil, posterURL: URL? = nil,
          remark: String? = nil, playSources: [TVPlaySource] = [],
-         sourceName: String = "公开检索", siteName: String = "公开检索", siteKey: String = "public", spiderSite: TVBoxSite? = nil, vodID: String? = nil) {
+         sourceName: String = "公开检索", siteName: String = "公开检索", siteKey: String = "public", spiderSite: TVBoxSite? = nil, vodID: String? = nil, sourceNamespace: String? = nil, legacyID: String? = nil) {
         self.id = id
         self.name = name
         self.detailURL = detailURL
@@ -98,10 +121,12 @@ struct TVMediaItem: Identifiable, Codable, Hashable {
         self.siteKey = siteKey
         self.spiderSite = spiderSite
         self.vodID = vodID
+        self.sourceNamespace = sourceNamespace
+        self.legacyID = legacyID
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, detailURL, posterURL, remark, playSources, sourceName, siteName, siteKey, spiderSite, vodID
+        case id, name, detailURL, posterURL, remark, playSources, sourceName, siteName, siteKey, spiderSite, vodID, sourceNamespace, legacyID
     }
 
     init(from decoder: Decoder) throws {
@@ -117,6 +142,22 @@ struct TVMediaItem: Identifiable, Codable, Hashable {
         siteKey = try container.decodeIfPresent(String.self, forKey: .siteKey) ?? "public"
         spiderSite = try container.decodeIfPresent(TVBoxSite.self, forKey: .spiderSite)
         vodID = try container.decodeIfPresent(String.self, forKey: .vodID)
+        sourceNamespace = try container.decodeIfPresent(String.self, forKey: .sourceNamespace)
+        legacyID = try container.decodeIfPresent(String.self, forKey: .legacyID)
+    }
+
+    /// 旧收藏缺少订阅 UUID 时，仅凭原 ID、来源名和 Spider 配置一致进行保守迁移。
+    func matchesFavorite(_ other: TVMediaItem) -> Bool {
+        if id == other.id { return true }
+        guard sourceNamespace == nil || other.sourceNamespace == nil,
+              (legacyID ?? id) == (other.legacyID ?? other.id),
+              sourceName == other.sourceName, siteKey == other.siteKey else { return false }
+        switch (spiderSite, other.spiderSite) {
+        case (nil, nil): return true
+        case let (left?, right?):
+            return left.adapter == right.adapter && left.spiderURL == right.spiderURL && left.spiderExt == right.spiderExt
+        default: return false
+        }
     }
 }
 
@@ -147,11 +188,26 @@ struct ResolvedMediaPlayback {
     let isDirect: Bool
 }
 
-/// 去掉同一播放地址（或同名同地址）重复项，保持源文件中的首次出现顺序。
+/// URL 的协议和主机名不区分大小写，路径及签名参数必须保持原值。
+func channelURLIdentity(_ url: URL) -> String {
+    guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+        return url.absoluteString
+    }
+    components.scheme = components.scheme?.lowercased()
+    components.host = components.host?.lowercased()
+    return components.string ?? url.absoluteString
+}
+
+/// 为新频道使用所属源的稳定身份；已有频道在更新时继续保留历史 ID。
+func stableChannelID(source: TVSource, name: String, url: URL) -> String {
+    "\(source.id.uuidString)|\(name)|\(url.absoluteString)"
+}
+
+/// 去掉同一播放地址重复项，保持源文件中的首次出现顺序。
 func deduplicatedChannels(_ channels: [TVChannel]) -> [TVChannel] {
     var seen = Set<String>()
     return channels.filter { channel in
-        let normalizedURL = channel.streamURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedURL = channelURLIdentity(channel.streamURL)
         let key = normalizedURL.isEmpty ? "name|\(channel.name.lowercased())|group|\(channel.group.lowercased())" : normalizedURL
         return seen.insert(key).inserted
     }

@@ -15,6 +15,10 @@ EMULATOR="$SDK_DIR/emulator/emulator"
 LOG_DIR="$RUNTIME_DIR/logs"
 LOCK_DIR="$RUNTIME_DIR/spider-service.lock"
 BRIDGE_APK="$RUNTIME_DIR/spider-bridge.apk"
+# 发布包携带与 Swift 客户端同批构建的 APK，优先于旧运行时缓存。
+if [ -f "$PROJECT_DIR/Bridge/spider-bridge.apk" ]; then
+  BRIDGE_APK="$PROJECT_DIR/Bridge/spider-bridge.apk"
+fi
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/spider-service-$(date +%Y%m%d-%H%M%S)-$$.log"
 # 直接写入独立日志文件，避免 process substitution 的 tee 在宿主 App
@@ -53,8 +57,17 @@ bounded() {
 
 adb() { bounded 15 "$ADB" "$@"; }
 
+# 业务线程不可回收时由 Bridge 显式请求进程重启，不能仅凭 HTTP 可达判断健康。
+RESTART_REQUIRED=0
 healthy() {
-  curl --silent --fail --max-time 2 -H "X-TVBox-Token: $TOKEN" "http://127.0.0.1:$PORT/health" | grep -q '"ready":true'
+  local response
+  RESTART_REQUIRED=0
+  response="$(curl --silent --fail --max-time 2 -H "X-TVBox-Token: $TOKEN" "http://127.0.0.1:$PORT/health")" || return 1
+  if printf '%s' "$response" | grep -Eq '"restartRequired"[[:space:]]*:[[:space:]]*true'; then
+    RESTART_REQUIRED=1
+    return 1
+  fi
+  printf '%s' "$response" | grep -Eq '"ready"[[:space:]]*:[[:space:]]*true'
 }
 
 # Reuse a bridge left by an earlier launcher attempt with the same session
@@ -179,7 +192,7 @@ for _ in $(seq 1 60); do
         failures=0
       else
         failures=$((failures + 1))
-        if [ "$failures" -ge 3 ]; then
+        if [ "$failures" -ge 3 ] || [ "$RESTART_REQUIRED" = 1 ]; then
           if [ $((SECONDS - recovery_window)) -ge 300 ]; then recoveries=0; recovery_window=$SECONDS; fi
           recoveries=$((recoveries + 1))
           [ "$recoveries" -le 3 ] || { echo "Spider recovery limit reached (3 in 5 minutes)" >&2; exit 1; }

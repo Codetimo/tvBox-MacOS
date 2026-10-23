@@ -23,7 +23,12 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.HashMap;
 
 /** Minimal dependency-free HTTP/1.1 loopback server used by the macOS client. */
@@ -38,8 +43,12 @@ final class BridgeHttpServer {
     private final StatusProvider statusProvider;
     private final EngineProvider engineProvider;
     private final PanLoginProvider panLoginProvider;
-    // 搜索会并行查询多个站点；保留足够线程让健康检查不被慢站点阻塞。
-    private final ExecutorService workers = Executors.newFixedThreadPool(16);
+    // HTTP readers never wait for Spider execution, so health remains independent of slow sites.
+    private final ExecutorService workers = new ThreadPoolExecutor(4, 4, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(32));
+    private final RequestExecutor operations = new RequestExecutor(16, 24, 8);
+    private static final AtomicLong REQUEST_IDS = new AtomicLong();
+    private final java.util.Set<Socket> clients = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile ServerSocket socket;
     private volatile boolean running;
 
@@ -69,33 +78,105 @@ final class BridgeHttpServer {
         socket = null;
         if (server != null) try { server.close(); } catch (IOException ignored) {}
         workers.shutdownNow();
+        operations.stop();
+        for (Socket client : clients) try { client.close(); } catch (IOException ignored) {}
+        clients.clear();
+    }
+
+    /** Include business-worker liveness, since a responsive HTTP listener alone is not readiness. */
+    private JSONObject healthStatus() {
+        JSONObject result = statusProvider.status();
+        try {
+            boolean recovery = operations.requiresRecovery() || result.optBoolean("restartRequired", false);
+            result.put("restartRequired", recovery);
+            result.put("activeOperations", operations.activeCount());
+            if (recovery) {
+                result.put("ok", false);
+                result.put("ready", false);
+                result.put("state", "recovery-required");
+            }
+        } catch (JSONException ignored) {}
+        return result;
     }
 
     private void acceptLoop(ServerSocket server) {
         while (running) {
             try {
                 Socket client = server.accept();
-                client.setSoTimeout(30_000);
-                workers.execute(() -> handle(client));
+                clients.add(client);
+                client.setSoTimeout(5_000);
+                try { workers.execute(() -> handle(client)); }
+                catch (RejectedExecutionException busy) { clients.remove(client); client.close(); }
             } catch (IOException error) {
                 if (running) android.util.Log.w("TVBoxBridge", "accept failed", error);
             }
         }
     }
 
+    /** Parse and authenticate on the ingress pool, then transfer socket ownership to a bounded operation. */
     private void handle(Socket client) {
-        try (Socket ignored = client;
-             InputStream input = new BufferedInputStream(client.getInputStream());
-             OutputStream output = new BufferedOutputStream(client.getOutputStream())) {
-            Request request = Request.parse(input);
-            if (!authorized(request)) { write(output, 401, error("unauthorized")); return; }
-            Response response = route(request);
-            write(output, response.status, response.body);
-        } catch (SocketTimeoutException ignored) {
-            // The client disappeared or sent an incomplete request.
-        } catch (Exception error) {
-            android.util.Log.w("TVBoxBridge", "request failed: " + error.getClass().getSimpleName());
+        String requestId = Long.toHexString(REQUEST_IDS.incrementAndGet());
+        long started = System.nanoTime();
+        AtomicBoolean completed = new AtomicBoolean();
+        try {
+            Request request = Request.parse(new BufferedInputStream(client.getInputStream()));
+            if (!authorized(request)) {
+                complete(client, completed, new Response(401, error("unauthorized")), requestId, "none", "auth", started);
+                return;
+            }
+            if ("GET".equals(request.method) && "/health".equals(request.path)) {
+                complete(client, completed, new Response(200, healthStatus()), requestId, "none", "health", started);
+                return;
+            }
+            JSONObject body = request.json();
+            String site = safeSite(value(body, request.query, "spider_class", "spiderClass", "site"));
+            String action = request.path.matches("/api/[a-z-]+") ? request.path.substring(5) : "unknown";
+            String packageKey = value(body, request.query, "spider_url", "spider");
+            boolean accepted = operations.submit(packageKey, 20_000, () -> {
+                Response response;
+                try { response = route(request); }
+                catch (VirtualMachineError | ThreadDeath fatal) {
+                    // Avoid allocating an error JSON after VM failure, but always release the client socket.
+                    try { client.close(); } catch (IOException ignored) {}
+                    finally { clients.remove(client); }
+                    throw fatal;
+                } catch (Throwable failure) {
+                    // FutureTask otherwise swallows provider AssertionError and leaves the socket unanswered.
+                    response = new Response(502, error(failure));
+                }
+                complete(client, completed, response, requestId, site, action, started);
+            }, () -> complete(client, completed, new Response(504, error("站源执行超时，请尝试其他站源。")),
+                    requestId, site, action, started));
+            if (!accepted) complete(client, completed, new Response(503, error("站源繁忙或仍有超时任务未退出，请尝试其他站源。")),
+                    requestId, site, action, started);
+        } catch (Exception failure) {
+            complete(client, completed, new Response(400, error("invalid request")), requestId, "none", "parse", started);
         }
+    }
+
+    /** Only one result wins a timeout race; never include request URLs, credentials or exception messages in logs. */
+    private void complete(Socket client, AtomicBoolean completed, Response response, String id,
+                                 String site, String action, long started) {
+        if (!completed.compareAndSet(false, true)) {
+            // A deadline may race a response blocked in write; close that socket to enforce the deadline.
+            try { client.close(); } catch (IOException ignored) {}
+            return;
+        }
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        String category = response.status == 200 ? "ok" : response.status == 504 ? "timeout" :
+                response.status == 503 ? "unavailable" : response.status == 502 ? "upstream" : "request";
+        if (!"health".equals(action)) android.util.Log.i("TVBoxBridge", "request_id=" + id + " site=" + site +
+                " action=" + action + " duration_ms=" + elapsed + " status=" + response.status + " category=" + category + " error_type=" + response.body.optString("error_type", "none"));
+        try (Socket ignored = client; OutputStream output = new BufferedOutputStream(client.getOutputStream())) {
+            response.body.put("request_id", id);
+            write(output, response.status, response.body);
+        } catch (Exception ignored) { /* Disconnected clients do not alter operation status. */ }
+        finally { clients.remove(client); }
+    }
+
+    /** Site class names are safe identifiers; reject arbitrary URL/credential-like values instead of echoing them. */
+    private static String safeSite(String value) {
+        return value.matches("[A-Za-z0-9_.$-]{1,120}") ? value : "redacted";
     }
 
     private boolean authorized(Request request) {
@@ -112,7 +193,7 @@ final class BridgeHttpServer {
 
     private Response route(Request request) throws Exception {
         if ("GET".equals(request.method) && "/health".equals(request.path)) {
-            return new Response(200, statusProvider.status());
+            return new Response(200, healthStatus());
         }
         if (!("POST".equals(request.method) || "GET".equals(request.method))) return new Response(405, error("method not allowed"));
         JSONObject body = request.json();
@@ -216,15 +297,16 @@ final class BridgeHttpServer {
     /** Third-party exceptions may echo ext/credentials; never log or return their messages for auth requests. */
     private static JSONObject requestError(Exception failure, JSONObject request) {
         if (!request.has("pan_cookies")) return error(failure);
-        android.util.Log.e("TVBoxBridge", "Authenticated Spider request failed: " + failure.getClass().getSimpleName());
-        return error("网盘配置或站源调用失败，请重试；若刚更新登录信息，请重新选择播放线路。");
+        return error(failure);
     }
 
-    private static JSONObject error(Exception error) {
-        android.util.Log.e("TVBoxBridge", "Spider request failed", error);
-        Throwable cause = error;
+    private static JSONObject error(Throwable failure) {
+        Throwable cause = failure;
         for (int i = 0; i < 12 && cause.getCause() != null && cause.getCause() != cause; i++) cause = cause.getCause();
-        return error(cause.toString());
+        // Third-party messages and stack traces can contain signed URLs even without pan_cookies.
+        JSONObject body = error("站源调用失败（" + cause.getClass().getSimpleName() + "），请尝试其他站源或更新配置。");
+        try { body.put("error_type", cause.getClass().getSimpleName()); } catch (JSONException ignored) {}
+        return body;
     }
 
     private static String value(JSONObject body, java.util.Map<String, String> query, String... names) {
@@ -288,7 +370,7 @@ final class BridgeHttpServer {
     private static void write(OutputStream output, int status, JSONObject body) throws IOException {
         byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
         String reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 401 ? "Unauthorized" :
-                status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed" : status == 502 ? "Bad Gateway" : "Service Unavailable";
+                status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed" : status == 502 ? "Bad Gateway" : status == 504 ? "Gateway Timeout" : "Service Unavailable";
         String header = "HTTP/1.1 " + status + " " + reason + "\r\n" +
                 "Content-Type: application/json; charset=utf-8\r\n" +
                 "Cache-Control: no-store\r\n" +
@@ -324,7 +406,9 @@ final class BridgeHttpServer {
             java.util.Map<String, String> query = parsePairs(question >= 0 ? target.substring(question + 1) : "");
             java.util.Map<String, String> headers = new java.util.HashMap<>();
             String header;
+            int headerCount = 0;
             while ((header = line(input)) != null && !header.isEmpty()) {
+                if (++headerCount > 64) throw new IOException("too many headers");
                 int colon = header.indexOf(':');
                 if (colon > 0) headers.put(header.substring(0, colon).trim().toLowerCase(Locale.US), header.substring(colon + 1).trim());
             }

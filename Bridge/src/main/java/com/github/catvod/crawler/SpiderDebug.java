@@ -12,11 +12,13 @@ public final class SpiderDebug {
 
     public static Context getContext() { return context; }
 
+    /** Provider stack traces can include signed URLs or cookies; retain only the failure type. */
     public static void log(Throwable error) {
-        if (error != null) android.util.Log.w("TVBoxSpider", error.toString(), error);
+        if (error != null) android.util.Log.w("TVBoxSpider", "provider_error=" + error.getClass().getSimpleName());
     }
 
+    /** Unstructured provider messages cannot be reliably redacted; structured Bridge logs carry diagnostics. */
     public static void log(String message) {
-        android.util.Log.d("TVBoxSpider", message == null ? "" : message);
+        // Intentionally suppress raw third-party text, which may contain credentials.
     }
 }

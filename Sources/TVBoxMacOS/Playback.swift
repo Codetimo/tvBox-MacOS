@@ -29,21 +29,55 @@ func playbackHTTPHeaders(overrides: [String: String] = [:]) -> [String: String] 
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         "Accept": "*/*"
     ]
-    overrides.forEach { headers[$0.key] = $0.value }
+    for (key, value) in overrides.sorted(by: { $0.key < $1.key }) {
+        // HTTP 头名不区分大小写，避免小写 user-agent 与默认值并存后被随机覆盖。
+        for existing in headers.keys.filter({ $0.caseInsensitiveCompare(key) == .orderedSame }) {
+            headers.removeValue(forKey: existing)
+        }
+        headers[key] = value
+    }
     return headers
 }
 
 /// 错误只展示可操作的说明及错误码，避免签名 URL 和 Cookie 出现在弹层中。
 func playbackFailureMessage(error: Error?, channel: TVChannel) -> String {
     let failure = error as NSError?
-    let reason: String
-    switch failure?.code {
-    case AVError.fileFormatNotRecognized.rawValue, AVError.decoderNotFound.rawValue:
-        reason = "当前系统播放器无法识别这条线路的媒体格式，请切换其他画质或线路。"
-    default:
-        reason = "媒体地址无法打开，可能已失效或返回了不受支持的媒体。请重新解析播放，或在下方切换线路。"
+    // AVFoundation 常把 URLSession 的 TLS 错误包在 NSUnderlyingErrorKey，限定深度防止循环。
+    var connectionFailure = failure
+    var tlsFailure: NSError?
+    var transportFailure: NSError?
+    for _ in 0..<8 {
+        guard let current = connectionFailure else { break }
+        // AVFoundation 也会把 ATS 的 -1022 包装成 NSOSStatusErrorDomain。
+        if [NSURLErrorDomain, NSOSStatusErrorDomain].contains(current.domain),
+           current.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+            transportFailure = current
+            break
+        }
+        if current.domain == NSURLErrorDomain,
+           [NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateHasBadDate,
+            NSURLErrorServerCertificateUntrusted, NSURLErrorServerCertificateHasUnknownRoot,
+            NSURLErrorServerCertificateNotYetValid, NSURLErrorClientCertificateRejected,
+            NSURLErrorClientCertificateRequired].contains(current.code) {
+            tlsFailure = current
+            break
+        }
+        connectionFailure = current.userInfo[NSUnderlyingErrorKey] as? NSError
     }
-    let code = failure.map { "\n错误码：\($0.domain) (\($0.code))" } ?? ""
+    let reason: String
+    if transportFailure != nil {
+        reason = "当前应用的网络安全配置阻止了此 HTTP 媒体连接。请更新或重新安装包含直播网络配置的应用版本后重试。"
+    } else if tlsFailure != nil {
+        reason = "无法与直播或媒体服务器建立安全连接，可能与服务器证书、上游 TLS 或代理链路有关。请切换线路，或检查系统时间与代理连接后重试。"
+    } else {
+        switch failure?.code {
+        case AVError.fileFormatNotRecognized.rawValue, AVError.decoderNotFound.rawValue:
+            reason = "当前系统播放器无法识别这条线路的媒体格式，请切换其他画质或线路。"
+        default:
+            reason = "媒体地址无法打开，可能已失效或返回了不受支持的媒体。请重新解析播放，或在下方切换线路。"
+        }
+    }
+    let code = (transportFailure ?? tlsFailure ?? failure).map { "\n错误码：\($0.domain) (\($0.code))" } ?? ""
     return "\(reason)\n线路：\(channel.group)\(code)"
 }
 
@@ -63,6 +97,7 @@ final class PlaybackCoordinator: ObservableObject {
     private var remuxSession: MediaRemuxSession?
     private var remuxMonitorTask: Task<Void, Never>?
     private var generation = UUID()
+    private var seekGeneration = UUID()
 
     /// 新线路启动失败时通知界面尝试同集备用源；已经播放后的错误不自动跳回开头。
     func play(_ channel: TVChannel, onStartupFailure: (() -> Void)? = nil) {
@@ -81,15 +116,15 @@ final class PlaybackCoordinator: ObservableObject {
             guard let self else { return }
             do {
                 var playable = channel
-                if try await MediaRemuxSession.needsRemux(channel) {
+                if let compatibility = try await MediaRemuxSession.compatibility(channel) {
                     try Task.checkCancellation()
-                    preparationMessage = "正在准备 MKV 兼容播放…"
-                    let session = try await MediaRemuxSession.start(channel: channel)
+                    preparationMessage = "正在准备 \(compatibility.label) 兼容播放…"
+                    let session = try await MediaRemuxSession.start(channel: channel, compatibility: compatibility)
                     guard !Task.isCancelled, generation == attempt else { session.stop(); return }
                     remuxSession = session
                     sourceDuration = session.sourceDuration
-                    timelineOffset = session.startTime
-                    compatibilityNotice = "MKV 兼容播放：进度按原片总时长显示，灰条表示缓存；跳转未缓存位置时需要重新加载。"
+                    timelineOffset = session.timelineOffset
+                    compatibilityNotice = "\(compatibility.label) 兼容播放：进度按原片总时长显示，灰条表示缓存；跳转未缓存位置时需要重新加载。"
                     monitorRemux(session, attempt: attempt)
                     playable = TVChannel(id: channel.id, name: channel.name, group: channel.group,
                                          logoURL: channel.logoURL, streamURL: session.playbackURL, headers: [:])
@@ -97,7 +132,7 @@ final class PlaybackCoordinator: ObservableObject {
                 try Task.checkCancellation()
                 guard generation == attempt else { return }
                 preparationMessage = nil
-                startNative(playable, onStartupFailure: onStartupFailure)
+                startNative(playable, onStartupFailure: onStartupFailure, initialSeek: remuxSession?.initialSeekTime)
             } catch {
                 guard !Task.isCancelled, generation == attempt else { return }
                 preparationMessage = nil
@@ -109,7 +144,7 @@ final class PlaybackCoordinator: ObservableObject {
     }
 
     /// 原生播放器和本地转封装结果共用状态监听及错误处理。
-    private func startNative(_ channel: TVChannel, onStartupFailure: (() -> Void)?, reusePlayer: AVPlayer? = nil, resumePlayback: Bool = true) {
+    private func startNative(_ channel: TVChannel, onStartupFailure: (() -> Void)?, reusePlayer: AVPlayer? = nil, resumePlayback: Bool = true, initialSeek: Double? = nil) {
         // Some CMS/CDN endpoints return 404 to AVPlayer's default client identity.
         // Keep source-provided headers authoritative while supplying a browser-like UA.
         let headers = playbackHTTPHeaders(overrides: channel.headers)
@@ -120,7 +155,13 @@ final class PlaybackCoordinator: ObservableObject {
         var failureReported = false
         itemStatusObservation = item.publisher(for: \.status).receive(on: DispatchQueue.main).sink { [weak self, weak item] status in
             guard let self, let item, self.player?.currentItem === item else { return }
-            if status == .readyToPlay { hasBeenReady = true }
+            if status == .readyToPlay, !hasBeenReady {
+                hasBeenReady = true
+                if let initialSeek, let player = self.player {
+                    self.seekPrecisely(player: player, item: item, localTime: initialSeek,
+                                       originalTime: initialSeek + self.timelineOffset, resumePlayback: resumePlayback)
+                }
+            }
             guard status == .failed, !failureReported else { return }
             failureReported = true
             self.remuxMonitorTask?.cancel()
@@ -133,16 +174,19 @@ final class PlaybackCoordinator: ObservableObject {
             if !hasBeenReady { onStartupFailure?() }
         }
         if let reusePlayer {
+            if initialSeek != nil { reusePlayer.pause() }
             reusePlayer.replaceCurrentItem(with: item)
             player = reusePlayer
         } else {
             player = AVPlayer(playerItem: item)
         }
-        if resumePlayback { player?.play() }
+        if resumePlayback, initialSeek == nil { player?.play() }
     }
 
     func stop() {
         generation = UUID()
+        seekGeneration = UUID()
+        player?.currentItem?.cancelPendingSeeks()
         preparationTask?.cancel()
         preparationTask = nil
         remuxMonitorTask?.cancel()
@@ -207,7 +251,7 @@ final class PlaybackCoordinator: ObservableObject {
                     pendingSeekTime = nil
                     if let session = remuxSession { monitorRemux(session, attempt: generation) }
                 }
-                player.seek(to: CMTime(seconds: localTarget, preferredTimescale: 600))
+                seekPrecisely(player: player, item: item, localTime: localTarget, originalTime: target)
                 return
             }
             restartRemux(channel: channel, at: target, player: player)
@@ -218,34 +262,56 @@ final class PlaybackCoordinator: ObservableObject {
         let lower = duration.isFinite && duration > 0 ? 0 : (range?.start.seconds ?? 0)
         let upper = duration.isFinite && duration > 0 ? duration : (range.map { CMTimeRangeGetEnd($0).seconds } ?? 0)
         guard lower.isFinite, upper.isFinite, upper > lower else { return }
-        player.seek(to: CMTime(seconds: min(max(seconds, lower), upper), preferredTimescale: 600))
+        let target = min(max(seconds, lower), upper)
+        seekPrecisely(player: player, item: item, localTime: target, originalTime: target)
+    }
+
+    /// 精确定位同一媒体时钟，并用请求标识忽略取消/旧项目的回调；连续方向键以最新目标累计。
+    private func seekPrecisely(player: AVPlayer, item: AVPlayerItem, localTime: Double,
+                               originalTime: Double, resumePlayback: Bool? = nil) {
+        seekGeneration = UUID()
+        let request = seekGeneration
+        pendingSeekTime = originalTime
+        item.cancelPendingSeeks()
+        player.seek(to: CMTime(seconds: localTime, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player, weak item] finished in
+            Task { @MainActor in
+                guard let self, let player, let item, self.seekGeneration == request,
+                      self.player === player, player.currentItem === item else { return }
+                self.pendingSeekTime = nil
+                guard finished else { return }
+                if resumePlayback == true { player.play() }
+            }
+        }
     }
 
     /// 取消过时的跳转任务，只有最新请求能替换播放项目；准备失败时保留原有会话。
     private func restartRemux(channel: TVChannel, at target: Double, player: AVPlayer) {
         preparationTask?.cancel()
         remuxMonitorTask?.cancel()
+        seekGeneration = UUID()
+        player.currentItem?.cancelPendingSeeks()
         generation = UUID()
         let attempt = generation
         let duration = sourceDuration
+        let compatibility = remuxSession?.compatibility
         pendingSeekTime = target
         preparationMessage = "正在加载跳转位置…"
         errorMessage = nil
         preparationTask = Task { [weak self, weak player] in
             guard let self, let player else { return }
             do {
-                let session = try await MediaRemuxSession.start(channel: channel, startTime: target, sourceDuration: duration)
+                let session = try await MediaRemuxSession.start(channel: channel, startTime: target, sourceDuration: duration, compatibility: compatibility)
                 guard !Task.isCancelled, generation == attempt else { session.stop(); return }
                 let shouldResume = player.timeControlStatus != .paused
                 remuxSession?.stop()
                 remuxSession = session
                 sourceDuration = session.sourceDuration
-                timelineOffset = session.startTime
+                timelineOffset = session.timelineOffset
                 pendingSeekTime = nil
                 preparationMessage = nil
                 let playable = TVChannel(id: channel.id, name: channel.name, group: channel.group,
                                          logoURL: channel.logoURL, streamURL: session.playbackURL, headers: [:])
-                startNative(playable, onStartupFailure: nil, reusePlayer: player, resumePlayback: shouldResume)
+                startNative(playable, onStartupFailure: nil, reusePlayer: player, resumePlayback: shouldResume, initialSeek: session.initialSeekTime)
                 monitorRemux(session, attempt: attempt)
             } catch {
                 guard !Task.isCancelled, generation == attempt else { return }
@@ -796,6 +862,13 @@ struct NativeWebView: NSViewRepresentable {
         view.allowsBackForwardNavigationGestures = true
         view.load(URLRequest(url: url))
         return view
+    }
+
+    /// 关闭播放窗口时销毁当前网页媒体，避免 WebKit 音频继续在后台播放。
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: ()) {
+        nsView.pauseAllMediaPlayback()
+        nsView.stopLoading()
+        nsView.loadHTMLString("", baseURL: nil)
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {

@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME_DIR="${TVBOX_RUNTIME_DIR:-$HOME/Library/Application Support/TVBoxMacOS/runtime}"
-SDK_DIR="$RUNTIME_DIR/android-sdk"
-JDK_DIR="$RUNTIME_DIR/jdk-17"
+SDK_DIR="${TVBOX_ANDROID_SDK_DIR:-$RUNTIME_DIR/android-sdk}"
+JDK_DIR="${TVBOX_JDK_DIR:-$RUNTIME_DIR/jdk-17}"
 BRIDGE_DIR="${TVBOX_BRIDGE_DIR:-$ROOT_DIR/Bridge}"
 BUILD_DIR="$RUNTIME_DIR/bridge-build"
 

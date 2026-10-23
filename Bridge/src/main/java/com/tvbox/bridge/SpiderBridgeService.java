@@ -37,6 +37,8 @@ public final class SpiderBridgeService extends Service {
     private final ExecutorService loader = Executors.newSingleThreadExecutor();
     private final Map<String, SpiderEngine> engines = new ConcurrentHashMap<>();
     private final Map<String, SpiderPackage> packages = new ConcurrentHashMap<>();
+    // Aliases and MD5 variants for identical bytes must share the native-owning ClassLoader.
+    private final Map<String, SpiderPackage> contentPackages = new ConcurrentHashMap<>();
     private volatile BridgeHttpServer server;
     private volatile SpiderPackage spiderPackage;
     private volatile String packageUrl = "";
@@ -45,8 +47,15 @@ public final class SpiderBridgeService extends Service {
     private volatile String token = "";
     private volatile int port = DEFAULT_PORT;
     private volatile String state = "starting";
-    private volatile long latestCookieVersion = -1;
+    private final java.util.concurrent.atomic.AtomicLong latestCookieVersion = new java.util.concurrent.atomic.AtomicLong(-1);
+    private final Map<String, Object> packageLocks = new ConcurrentHashMap<>();
+    private final Map<String, Long> packageChecks = new ConcurrentHashMap<>();
+    private static final long PACKAGE_RECHECK_MILLIS = 5 * 60 * 1000L;
     private volatile String lastError = "";
+    private volatile boolean restartRequired;
+    private final java.util.concurrent.atomic.AtomicInteger constructedEngines = new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicBoolean CACHE_INITIALIZED = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final int MAX_PACKAGE_ALIASES = 256, MAX_ENGINES = 512;
 
     @Override public void onCreate() {
         super.onCreate();
@@ -86,12 +95,16 @@ public final class SpiderBridgeService extends Service {
 
     private void startBridge(String md5) {
         try {
+            // Service recreation can retain native libraries; only a fresh Android process may prune files.
+            if (CACHE_INITIALIZED.compareAndSet(false, true)) {
+                PackageCache.cleanupColdCache(new File(getCodeCacheDir(), "tvbox-spider"));
+            }
             // The macOS launcher starts the service before it knows which
             // source the user will search. In that mode package download is
             // deferred until the first request carrying `spider`/`md5`.
             if (packageUrl != null && !packageUrl.trim().isEmpty()) {
                 state = "downloading";
-                spiderPackage = SpiderPackage.prepare(this, packageUrl, md5);
+                spiderPackage = packageFor(packageUrl + "\u0000" + trim(md5), packageUrl, md5);
             }
             server = new BridgeHttpServer(port, token, this::status, this::engineFor, this::panLogin);
             server.start();
@@ -99,50 +112,45 @@ public final class SpiderBridgeService extends Service {
             Log.i("TVBoxBridge", "Spider bridge listening on 127.0.0.1:" + port);
         } catch (Exception error) {
             state = "error";
-            lastError = error.getMessage() == null ? error.toString() : error.getMessage();
-            Log.e("TVBoxBridge", "Spider bridge failed to start", error);
+            lastError = error.getClass().getSimpleName();
+            Log.e("TVBoxBridge", "Spider bridge failed to start: " + lastError);
         }
     }
 
-    private synchronized SpiderEngine engineFor(JSONObject request) throws Exception {
-        // Queued searches must not restore a credential after a newer login/logout request.
-        if (request.has("pan_cookies")) {
-            long version = request.optLong("pan_cookie_version", -1);
-            if (version < 0 || version < latestCookieVersion) {
-                throw new IllegalStateException("网盘登录信息已更新，请重试当前操作。");
-            }
-            latestCookieVersion = version;
-        }
+    /** Serialize package state only: downloads and constructors for unrelated packages remain independent. */
+    private SpiderEngine engineFor(JSONObject request) throws Exception {
         String requestedURL = trim(request.optString(EXTRA_URL, request.optString("spider", "")));
         String requestedMd5 = trim(request.optString(EXTRA_MD5, request.optString("md5", "")));
         if (requestedURL.isEmpty()) requestedURL = packageUrl;
         if (requestedURL == null || requestedURL.isEmpty()) throw new IllegalStateException("spider_url is required");
         String packageKey = requestedURL + "\u0000" + requestedMd5;
-        SpiderPackage pack = packages.get(packageKey);
-        if (pack == null) {
-            pack = SpiderPackage.prepare(this, requestedURL, requestedMd5);
-            packages.put(packageKey, pack);
-        }
-        if (pack.synchronizeCookies(this, request.optJSONObject("pan_cookies"), request.optLong("pan_cookie_version", -1))) {
-            // Recreate cached site instances after account changes; otherwise they may retain old auth state.
-            final String prefix = packageKey + "\u0000";
-            for (String cachedKey : engines.keySet()) if (cachedKey.startsWith(prefix)) engines.remove(cachedKey);
-        }
-        String className = trim(request.optString(EXTRA_CLASS,
-                request.optString("spiderClass", request.optString("spider_class", defaultClass))));
-        String extend = request.has(EXTRA_EXTEND) ? request.optString(EXTRA_EXTEND, "") :
-                request.optString("ext", defaultExtend);
-        if (className.isEmpty()) throw new IllegalArgumentException("spider_class is required");
-        String key = packageKey + "\u0000" + className + "\u0000" + extend;
-        SpiderEngine existing = engines.get(key);
-        if (existing != null) return existing;
-        synchronized (engines) {
-            existing = engines.get(key);
-            if (existing == null) {
+        synchronized (packageLockFor(packageKey)) {
+            validateCookieVersion(request);
+            SpiderPackage pack = packageFor(packageKey, requestedURL, requestedMd5);
+            synchronized (pack) {
+                validateCookieVersion(request); // A concurrent package may have advanced credentials during download.
+                if (pack.synchronizeCookies(this, request.optJSONObject("pan_cookies"), request.optLong("pan_cookie_version", -1))) {
+                    // Recreate cached site instances after account changes; otherwise they may retain old auth state.
+                    final String prefix = pack.file().getAbsolutePath() + "\u0000";
+                    for (String cachedKey : engines.keySet()) if (cachedKey.startsWith(prefix)) engines.remove(cachedKey);
+                }
+                String className = trim(request.optString(EXTRA_CLASS,
+                        request.optString("spiderClass", request.optString("spider_class", defaultClass))));
+                String extend = request.has(EXTRA_EXTEND) ? request.optString(EXTRA_EXTEND, "") :
+                        request.optString("ext", defaultExtend);
+                if (className.isEmpty()) throw new IllegalArgumentException("spider_class is required");
+                String key = pack.file().getAbsolutePath() + "\u0000" + className + "\u0000" + extend;
+                SpiderEngine existing = engines.get(key);
+                if (existing != null) return existing;
+                if (constructedEngines.incrementAndGet() > MAX_ENGINES) {
+                    constructedEngines.decrementAndGet();
+                    throw requireRecovery();
+                }
+                // A failed constructor can have created native state too; retain its session budget.
                 existing = SpiderEngine.load(this, pack, className, extend);
                 engines.put(key, existing);
+                return existing;
             }
-            return existing;
         }
     }
 
@@ -153,22 +161,66 @@ public final class SpiderBridgeService extends Service {
         if (requestedURL.isEmpty()) requestedURL = packageUrl;
         if (requestedURL == null || requestedURL.isEmpty()) throw new IllegalArgumentException("spider_url is required");
         String packageKey = requestedURL + "\u0000" + requestedMd5;
-        SpiderPackage pack;
-        synchronized (this) {
-            pack = packages.get(packageKey);
-            if (pack == null) {
-                pack = SpiderPackage.prepare(this, requestedURL, requestedMd5);
-                packages.put(packageKey, pack);
+        synchronized (packageLockFor(packageKey)) {
+            SpiderPackage pack = packageFor(packageKey, requestedURL, requestedMd5);
+            synchronized (pack) {
+                JSONObject result = pack.panLogin(this, request.optString("provider", ""),
+                        request.optString("action", ""), request.optString("taskId", ""),
+                        Math.max(latestCookieVersion.get(), request.optLong("pan_cookie_version", -1)));
+                if ("success".equals(result.optString("status"))) {
+                    final String prefix = pack.file().getAbsolutePath() + "\u0000";
+                    for (String cachedKey : engines.keySet()) if (cachedKey.startsWith(prefix)) engines.remove(cachedKey);
+                }
+                return result;
             }
         }
-        JSONObject result = pack.panLogin(this, request.optString("provider", ""),
-                request.optString("action", ""), request.optString("taskId", ""),
-                Math.max(latestCookieVersion, request.optLong("pan_cookie_version", -1)));
-        if ("success".equals(result.optString("status"))) {
-            final String prefix = packageKey + "\u0000";
-            for (String cachedKey : engines.keySet()) if (cachedKey.startsWith(prefix)) engines.remove(cachedKey);
+    }
+
+    /** Check versions atomically without retaining a service-wide lock across third-party calls. */
+    private void validateCookieVersion(JSONObject request) {
+        if (!request.has("pan_cookies")) return;
+        long version = request.optLong("pan_cookie_version", -1);
+        while (true) {
+            long previous = latestCookieVersion.get();
+            if (version < 0 || version < previous) throw new IllegalStateException("网盘登录信息已更新，请重试当前操作。");
+            if (latestCookieVersion.compareAndSet(previous, version)) return;
         }
-        return result;
+    }
+
+    /** Revalidate mutable URLs periodically; retain loader/login state when bytes have not changed. Caller holds package lock. */
+    private SpiderPackage packageFor(String key, String url, String md5) throws Exception {
+        SpiderPackage current = packages.get(key);
+        long now = android.os.SystemClock.elapsedRealtime();
+        long checked = packageChecks.getOrDefault(key, 0L);
+        if (current == null || (SpiderPackage.normalizeMd5(md5) == null && now - checked >= PACKAGE_RECHECK_MILLIS
+                && !current.hasPendingLogin())) {
+            SpiderPackage prepared;
+            try { prepared = SpiderPackage.prepare(this, url, md5); }
+            catch (PackageCache.CapacityException capacity) { throw requireRecovery(); }
+            SpiderPackage canonical = contentPackages.putIfAbsent(prepared.file().getAbsolutePath(), prepared);
+            current = canonical == null ? prepared : canonical;
+            packages.put(key, current);
+            packageChecks.put(key, now);
+        }
+        return current;
+    }
+
+    /** Bound aliases/locks before allocation without serializing network or third-party execution. */
+    private Object packageLockFor(String key) throws PackageCache.CapacityException {
+        synchronized (packageLocks) {
+            Object existing = packageLocks.get(key);
+            if (existing != null) return existing;
+            if (packageLocks.size() >= MAX_PACKAGE_ALIASES) throw requireRecovery();
+            Object created = new Object();
+            packageLocks.put(key, created);
+            return created;
+        }
+    }
+
+    /** Ask the host to force-stop this process before reclaiming loaders, threads or native cache files. */
+    private PackageCache.CapacityException requireRecovery() {
+        restartRequired = true;
+        return new PackageCache.CapacityException();
     }
 
     private JSONObject status() {
@@ -176,11 +228,14 @@ public final class SpiderBridgeService extends Service {
         try {
             result.put("ok", "ready".equals(state));
             result.put("ready", "ready".equals(state));
+            result.put("restartRequired", restartRequired);
+            result.put("loadedPackageVersions", contentPackages.size());
+            result.put("constructedEngines", constructedEngines.get());
             result.put("engine", "android-dex");
             result.put("state", state);
             result.put("port", port);
             result.put("loopback", true);
-            result.put("packageUrl", packageUrl == null ? "" : packageUrl);
+            result.put("packageConfigured", packageUrl != null && !packageUrl.isEmpty());
             result.put("spiderClass", defaultClass);
             if (!lastError.isEmpty()) result.put("error", lastError);
         } catch (Exception ignored) {}
@@ -194,6 +249,7 @@ public final class SpiderBridgeService extends Service {
         loader.shutdownNow();
         engines.clear();
         packages.clear();
+        contentPackages.clear();
         state = "stopped";
         stopForeground(true);
         super.onDestroy();

@@ -44,3 +44,11 @@ History uses prefixes such as `feat:`, `fix:`, `test:`, and `ci:` with short imp
 ## Security & Configuration
 
 Never commit cookies, authentication tokens, signed URLs, or local runtime caches. Keep Bridge endpoints loopback-only and authenticated with `X-TVBox-Token`. Preserve download validation, bounded retries, and process cleanup.
+
+## 项目变更留痕
+
+- 修改代码后，根据 Git diff 判断是否需要留痕。
+- 涉及业务逻辑、接口、数据库、配置或架构的变更，记录到 `docs/changes/`；纯格式调整等无实质影响的改动可跳过。
+- 记录变更原因、主要内容、关键决策、验证结果及必要的风险或回滚说明。
+- 以实际代码差异和验证结果为准，不得编造；完成后检查记录与代码是否一致。
+- 日常小改动保持轻量；重大跨模块改造再采用 OpenSpec 等结构化流程。

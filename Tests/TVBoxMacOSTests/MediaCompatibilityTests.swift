@@ -127,7 +127,7 @@ final class MediaCompatibilityTests: XCTestCase {
     }
 
     @MainActor
-    func testMatroskaSeekKeepsFullDurationAndResetsFragmentTimeline() async throws {
+    func testMatroskaSeekKeepsFullDurationAndOriginalFragmentTimestamp() async throws {
         let executable = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/TVBoxMacOS/runtime/media/ffmpeg")
         guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw XCTSkip("Run scripts/setup_media_runtime.sh for media integration tests") }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -164,7 +164,76 @@ final class MediaCompatibilityTests: XCTestCase {
         let track = try XCTUnwrap(tracks.first)
         let range = try await track.load(.timeRange)
         XCTAssertEqual(range.start.seconds, 0, accuracy: 0.1)
+        XCTAssertEqual(session.timelineOffset, 4, accuracy: 0.1)
         XCTAssertEqual(range.duration.seconds, 4, accuracy: 0.1)
+    }
+
+    /// 用带 B 帧、10 秒 GOP 和 AAC 的真实媒体验证非关键帧跳转后的解码时间戳。
+    @MainActor
+    func testNonKeyframeRemuxPreservesAudioVideoSync() async throws {
+        let executable = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/TVBoxMacOS/runtime/media/ffmpeg")
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw XCTSkip("Run scripts/setup_media_runtime.sh for media integration tests") }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let generator = Process()
+        generator.executableURL = executable
+        generator.arguments = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=160x90:r=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "24", "-c:v", "libx264",
+            "-g", "240", "-sc_threshold", "0", "-bf", "3", "-c:a", "aac", "-output_ts_offset", "5",
+            "-f", "matroska", folder.appendingPathComponent("init.mp4").path]
+        generator.standardError = FileHandle.nullDevice
+        try generator.run(); generator.waitUntilExit()
+        XCTAssertEqual(generator.terminationStatus, 0)
+        let origin = LocalMediaHTTPServer(directory: folder)
+        let base = try await origin.start()
+        defer { origin.stop() }
+        let channel = TVChannel(id: "av-sync", name: "AV sync", group: "test", logoURL: nil,
+                                streamURL: base.appendingPathComponent("init.mp4"), headers: [:])
+        let session = try await MediaRemuxSession.start(channel: channel, startTime: 17.3)
+        defer { session.stop() }
+        // 非零源时间戳先归一化，再加实际关键帧偏移，不能直接使用请求位置作为偏移。
+        XCTAssertEqual(session.timelineOffset, 10, accuracy: 0.15)
+        XCTAssertEqual(session.initialSeekTime + session.timelineOffset, 17.3, accuracy: 0.001)
+        let (playlistData, _) = try await URLSession.shared.data(from: session.playbackURL)
+        let playlist = String(decoding: playlistData, as: UTF8.self)
+        let fragmentName = try XCTUnwrap(playlist.components(separatedBy: .newlines).first { $0.hasSuffix(".m4s") })
+        let mediaBase = session.playbackURL.deletingLastPathComponent()
+        var (movie, _) = try await URLSession.shared.data(from: mediaBase.appendingPathComponent("init.mp4"))
+        let (fragment, _) = try await URLSession.shared.data(from: mediaBase.appendingPathComponent(fragmentName))
+        movie.append(fragment)
+        let resultURL = folder.appendingPathComponent("decoded.mp4")
+        try movie.write(to: resultURL)
+        // 解码实际分片，并读取首个音频/视频输出 PTS；旧实现的音频会晚约 7.26 秒。
+        var decodedTimes: [Double] = []
+        // 分别解码两轨以避免 FFmpeg 并行日志互相穿插；两次均使用同一容器的公共起点。
+        for (filter, options) in [("showinfo", ["-an", "-vf", "showinfo"]), ("ashowinfo", ["-vn", "-af", "ashowinfo"])] {
+            let logURL = folder.appendingPathComponent("decode-\(filter).log")
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            let log = try FileHandle(forWritingTo: logURL)
+            defer { try? log.close() }
+            let decoder = Process()
+            decoder.executableURL = executable
+            decoder.arguments = ["-hide_banner", "-i", resultURL.path] + options + ["-t", "0.3", "-f", "null", "-"]
+            decoder.standardOutput = FileHandle.nullDevice
+            decoder.standardError = log
+            try decoder.run(); decoder.waitUntilExit()
+            XCTAssertEqual(decoder.terminationStatus, 0)
+            let output = try String(contentsOf: logURL, encoding: .utf8)
+            decodedTimes.append(try firstDecodedTime(in: output, filter: filter))
+        }
+        let video = decodedTimes[0]
+        let audio = decodedTimes[1]
+        XCTAssertLessThan(abs(video - audio), 0.15, "Audio and video must retain the same clock after non-keyframe seek")
+    }
+
+    /// 提取 FFmpeg 首个已解码帧的展示时间，避免将容器可打开等同于音视频同步。
+    private func firstDecodedTime(in output: String, filter: String) throws -> Double {
+        let expression = try NSRegularExpression(pattern: "Parsed_" + filter + #"_[^\n]*?n:\s*0\s[^\n]*?pts_time:([-0-9.]+)"#)
+        let range = NSRange(output.startIndex..<output.endIndex, in: output)
+        let match = try XCTUnwrap(expression.firstMatch(in: output, range: range), "Missing decoded \(filter) timestamp: \(output)")
+        let valueRange = try XCTUnwrap(Range(match.range(at: 1), in: output))
+        return try XCTUnwrap(Double(output[valueRange]))
     }
 
 }

@@ -12,5 +12,34 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: swift build
+      - name: Prepare verified FFmpeg for media integration tests
+        run: |
+          scripts/setup_media_runtime.sh
+          test -x "$HOME/Library/Application Support/TVBoxMacOS/runtime/media/ffmpeg"
       - name: Test
-        run: swift test
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test 2>&1 | tee "$RUNNER_TEMP/tvbox-swift-tests.log"
+          if grep -E '^Test Case .* skipped|: Test skipped -' "$RUNNER_TEMP/tvbox-swift-tests.log"; then
+            echo 'Required tests were skipped; verify the media runtime.' >&2
+            exit 1
+          fi
+
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android build inputs
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Test Bridge admission and package cache
+        run: scripts/test_spider_bridge.sh
+      - name: Build signed Bridge APK
+        env:
+          TVBOX_RUNTIME_DIR: ${{ runner.temp }}/tvbox-runtime
+        run: TVBOX_JDK_DIR="$JAVA_HOME" TVBOX_ANDROID_SDK_DIR="$ANDROID_HOME" scripts/build_spider_bridge.sh

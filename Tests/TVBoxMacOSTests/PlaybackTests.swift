@@ -41,6 +41,44 @@ final class PlaybackTests: XCTestCase {
         XCTAssertTrue(message.contains("第03集"))
     }
 
+    func testTLSErrorsExplainSecureConnectionFailureWithoutLeakingURLs() {
+        let channel = TVChannel(id: "tls", name: "直播", group: "直播线路", logoURL: nil,
+                                streamURL: URL(string: "https://example.com/live?token=private-signature")!, headers: [:])
+        for code in [NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted] {
+            let tls = NSError(domain: NSURLErrorDomain, code: code,
+                              userInfo: [NSLocalizedDescriptionKey: channel.streamURL.absoluteString])
+            let wrapped = NSError(domain: AVFoundationErrorDomain, code: AVError.unknown.rawValue,
+                                  userInfo: [NSUnderlyingErrorKey: tls])
+            for error in [tls, wrapped] {
+                let message = playbackFailureMessage(error: error, channel: channel)
+                XCTAssertTrue(message.contains("安全连接"))
+                XCTAssertTrue(message.contains("TLS"))
+                XCTAssertTrue(message.contains("NSURLErrorDomain (\(code))"))
+                XCTAssertFalse(message.contains("private-signature"))
+                XCTAssertFalse(message.contains("关闭证书"))
+            }
+        }
+    }
+
+    /// 同一个 ATS 错误在 URLSession 与 AVFoundation 中使用不同 domain，均应显示真实原因。
+    func testTransportSecurityErrorsExplainAppConfigurationWithoutLeakingURLs() {
+        let channel = TVChannel(id: "ats", name: "CCTV2", group: "央视IPV4", logoURL: nil,
+                                streamURL: URL(string: "http://example.com/live?token=private-signature")!, headers: [:])
+        for domain in [NSURLErrorDomain, NSOSStatusErrorDomain] {
+            let underlying = NSError(domain: domain, code: NSURLErrorAppTransportSecurityRequiresSecureConnection,
+                                     userInfo: [NSLocalizedDescriptionKey: channel.streamURL.absoluteString])
+            let wrapped = NSError(domain: AVFoundationErrorDomain, code: AVError.unknown.rawValue,
+                                  userInfo: [NSUnderlyingErrorKey: underlying])
+            for error in [underlying, wrapped] {
+                let message = playbackFailureMessage(error: error, channel: channel)
+                XCTAssertTrue(message.contains("网络安全配置"))
+                XCTAssertTrue(message.contains("\(domain) (-1022)"))
+                XCTAssertFalse(message.contains("private-signature"))
+                XCTAssertFalse(message.contains("已失效"))
+            }
+        }
+    }
+
     @MainActor
     func testFullscreenPlayerFillsContentAfterWindowResize() throws {
         _ = NSApplication.shared

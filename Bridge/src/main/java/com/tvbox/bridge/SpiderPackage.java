@@ -7,23 +7,15 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URI;
-import java.net.URL;
 import java.security.MessageDigest;
 import java.util.Locale;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
 
 /** Downloads, verifies, and prepares one remote Spider package for DexClassLoader. */
 final class SpiderPackage {
-    static final long MAX_BYTES = 64L * 1024L * 1024L;
     private final File file;
     private final File nativeDirectory;
     private ClassLoader loader;
@@ -215,7 +207,8 @@ final class SpiderPackage {
         if (initializationError != null) throw initializationError;
         if (loader != null) return loader;
         try {
-            File optimized = new File(context.getCodeCacheDir(), "tvbox-spider/optimized");
+            // Keep optimized DEX output inside its immutable version so cold eviction reclaims it too.
+            File optimized = new File(file.getParentFile(), "optimized");
             if (!optimized.exists() && !optimized.mkdirs()) throw new IOException("cannot create dex cache");
             ClassLoader candidate = new DexClassLoader(file.getAbsolutePath(), optimized.getAbsolutePath(),
                     nativeDirectory.getAbsolutePath(), context.getClassLoader());
@@ -250,106 +243,17 @@ final class SpiderPackage {
         }
     }
 
+    /** Download mutable URLs on revalidation; archive and native paths are immutable content versions. */
     static SpiderPackage prepare(Context context, String url, String expectedMd5) throws Exception {
-        if (url == null || url.trim().isEmpty()) throw new IOException("spider_url is required");
-        URI uri = URI.create(url.trim());
-        String scheme = uri.getScheme();
-        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-            throw new IOException("spider_url must use http or https");
-        }
-        File root = new File(context.getCodeCacheDir(), "tvbox-spider");
-        if (!root.exists() && !root.mkdirs()) throw new IOException("cannot create spider cache");
-        String key = sha256(url.trim());
-        File cached = new File(root, key + ".dex.zip");
-        String md5 = normalizeMd5(expectedMd5);
-        if (!cached.isFile() || (md5 != null && !md5.equals(md5(cached)))) {
-            // DexClassLoader rejects writable code archives on recent Android
-            // releases. Re-enable writes only while replacing a bad cache.
-            //noinspection ResultOfMethodCallIgnored
-            cached.setWritable(true, false);
-            download(uri.toURL(), cached, md5);
-        } else if (md5 != null && !md5.equals(md5(cached))) {
-            throw new IOException("cached Spider MD5 mismatch");
-        }
-        //noinspection ResultOfMethodCallIgnored
-        cached.setReadable(true, false);
-        //noinspection ResultOfMethodCallIgnored
-        cached.setWritable(false, false);
-        File nativeDirectory = new File(root, key + "/native");
-        extractNativeLibraries(cached, nativeDirectory);
-        return new SpiderPackage(cached, nativeDirectory);
-    }
-
-    private static void download(URL url, File destination, String expectedMd5) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setConnectTimeout(20_000);
-        connection.setReadTimeout(30_000);
-        connection.setInstanceFollowRedirects(true);
-        connection.setRequestProperty("User-Agent", "TVBoxMacOS-AndroidBridge/1.0");
-        connection.setRequestProperty("Accept", "application/octet-stream,*/*");
-        int status = connection.getResponseCode();
-        if (status < 200 || status >= 300) throw new IOException("Spider download HTTP " + status);
-        long length = connection.getContentLengthLong();
-        if (length > MAX_BYTES) throw new IOException("Spider package exceeds 64 MiB");
-        File temporary = new File(destination.getPath() + ".part");
-        long total = 0;
-        try (InputStream input = new BufferedInputStream(connection.getInputStream());
-             FileOutputStream output = new FileOutputStream(temporary)) {
-            byte[] buffer = new byte[32 * 1024];
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                total += count;
-                if (total > MAX_BYTES) throw new IOException("Spider package exceeds 64 MiB");
-                output.write(buffer, 0, count);
-            }
-        } finally {
-            connection.disconnect();
-        }
-        if (expectedMd5 != null && !expectedMd5.equals(md5(temporary))) {
-            // Do not retain a failed download.  The caller receives a hard error
-            // and cannot accidentally run a package with a wrong checksum.
-            //noinspection ResultOfMethodCallIgnored
-            temporary.delete();
-            throw new IOException("Spider package MD5 mismatch");
-        }
-        if (!temporary.renameTo(destination)) {
-            copy(temporary, destination);
-            //noinspection ResultOfMethodCallIgnored
-            temporary.delete();
-        }
-    }
-
-    private static void extractNativeLibraries(File archive, File target) throws Exception {
-        if (!target.exists() && !target.mkdirs()) throw new IOException("cannot create native cache");
         String preferred = Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0
                 ? Build.SUPPORTED_ABIS[0] : "arm64-v8a";
-        try (ZipFile zip = new ZipFile(archive)) {
-            java.util.Enumeration<? extends ZipEntry> entries = zip.entries();
-            while (entries.hasMoreElements()) {
-                ZipEntry entry = entries.nextElement();
-                String name = entry.getName();
-                if (entry.isDirectory() || !name.startsWith("assets/") || !name.endsWith(".so")) continue;
-                String base = new File(name).getName();
-                // The package has v7/v8 ARM libraries. On a 64-bit process use
-                // v8; on 32-bit use v7. Other architectures are reported in
-                // health but are not silently emulated.
-                if (preferred.contains("64") && !base.contains("v8")) continue;
-                if (!preferred.contains("64") && !base.contains("v7")) continue;
-                File out = new File(target, base);
-                if (out.isFile() && out.length() == entry.getSize()) continue;
-                try (InputStream input = zip.getInputStream(entry);
-                     FileOutputStream output = new FileOutputStream(out)) {
-                    byte[] buffer = new byte[16 * 1024];
-                    int count;
-                    while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-                }
-                //noinspection ResultOfMethodCallIgnored
-                out.setReadable(true, true);
-                //noinspection ResultOfMethodCallIgnored
-                out.setExecutable(true, true);
-            }
-        }
+        PackageCache.Prepared prepared = PackageCache.prepare(new File(context.getCodeCacheDir(), "tvbox-spider"),
+                url, expectedMd5, preferred);
+        return new SpiderPackage(prepared.archive, prepared.nativeDirectory);
     }
+
+    /** Keep the active QR task attached to its current loader until it completes or expires. */
+    synchronized boolean hasPendingLogin() { return !loginTasks.isEmpty(); }
 
     static String normalizeMd5(String value) {
         if (value == null) return null;
@@ -381,12 +285,4 @@ final class SpiderPackage {
         return result.toString();
     }
 
-    private static void copy(File source, File destination) throws Exception {
-        try (InputStream input = new BufferedInputStream(new FileInputStream(source));
-             BufferedOutputStream output = new BufferedOutputStream(new FileOutputStream(destination))) {
-            byte[] buffer = new byte[32 * 1024];
-            int count;
-            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-        }
-    }
 }

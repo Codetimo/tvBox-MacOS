@@ -41,7 +41,7 @@ final class CMSCompatibilityTests: XCTestCase {
         try Data(#"{"sites":[{"key":"cms","name":"CMS","api":"https://example.com/api.php"}]}"#.utf8).write(to: fileURL)
         let catalog = try await SourceLoader().loadCatalog(url: fileURL)
         XCTAssertEqual(catalog.first?.key, "cms")
-        let snapshot = try SourceLoader().load(fileURL: fileURL)
+        let snapshot = try await SourceLoader().load(fileURL: fileURL)
         XCTAssertEqual(snapshot.source.kind, .tvboxJSON)
         XCTAssertTrue(snapshot.channels.isEmpty)
     }

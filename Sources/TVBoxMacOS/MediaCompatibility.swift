@@ -2,53 +2,59 @@ import Foundation
 import Network
 import Darwin
 
-/// 为 AVPlayer 不支持的 MKV 容器提供本地 HLS；视频只换容器，音频转换为 AAC。
+/// 为 AVPlayer 不支持的 MKV 容器和 hev1 MP4 提供本地 HLS；视频只换容器，音频转换为 AAC。
 @MainActor
 final class MediaRemuxSession {
     let playbackURL: URL
     let sourceDuration: Double?
     let startTime: Double
+    private(set) var timelineOffset = 0.0
+
+    /// 关键帧之前的数据由 AVPlayer 解码后丢弃，音视频使用同一个精确跳转目标。
+    var initialSeekTime: Double { max(0, startTime - timelineOffset) }
+    let compatibility: Compatibility?
     private let process: Process
     private let server: LocalMediaHTTPServer
     private let directory: URL
+    private var isStopped = false
 
-    private init(playbackURL: URL, sourceDuration: Double?, startTime: Double, process: Process, server: LocalMediaHTTPServer, directory: URL) {
+    private init(playbackURL: URL, sourceDuration: Double?, startTime: Double, compatibility: Compatibility?, process: Process, server: LocalMediaHTTPServer, directory: URL) {
         self.playbackURL = playbackURL
         self.sourceDuration = sourceDuration
         self.startTime = startTime
+        self.compatibility = compatibility
         self.process = process
         self.server = server
         self.directory = directory
     }
 
-    deinit { Self.cleanup(process: process, server: server, directory: directory) }
+    deinit { if !isStopped { Self.cleanup(process: process, server: server, directory: directory) } }
 
-    /// 检查真实文件头，不信任网盘文件名或错误的 Content-Type。
-    static func needsRemux(_ channel: TVChannel) async throws -> Bool {
-        let url = channel.streamURL
-        let localProxy = ["127.0.0.1", "localhost", "::1", "[::1]"].contains(url.host?.lowercased() ?? "")
-        guard localProxy || url.pathExtension.lowercased() == "mkv" else { return false }
-        return isMatroska(Array(try await readPrefix(channel, count: 4)))
+    struct Compatibility {
+        let label: String
+        let retagHEVC: Bool
+        let duration: Double?
     }
 
-    /// 用有界流读取文件头；即便源站忽略 Range，也只保留指定字节数。
-    private static func readPrefix(_ channel: TVChannel, count: Int) async throws -> Data {
-        var request = URLRequest(url: channel.streamURL, timeoutInterval: 15)
-        playbackHTTPHeaders(overrides: channel.headers).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
-        request.setValue("bytes=0-\(count - 1)", forHTTPHeaderField: "Range")
-        let session = URLSession(configuration: .ephemeral)
-        defer { session.invalidateAndCancel() }
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw SourceParseError.invalidInput("媒体服务返回 HTTP \(status)，请重新解析或切换线路。")
+    /// 检查真实容器与视频 sample entry，不信任扩展名或 MIME；未知格式保留原生播放机会。
+    static func compatibility(_ channel: TVChannel, session: URLSession = .shared) async throws -> Compatibility? {
+        do {
+            let (prefix, response) = try await MediaProbe.readPrefix(url: channel.streamURL, headers: channel.headers, count: 65_536, session: session)
+            if isMatroska(Array(prefix.prefix(4))) {
+                return Compatibility(label: "MKV", retagHEVC: prefix.range(of: Data("V_MPEGH/ISO/HEVC".utf8)) != nil,
+                                     duration: matroskaDuration(in: prefix))
+            }
+            let metadata = try await MP4CompatibilityProbe(channel: channel, prefix: prefix, response: response, session: session).inspect()
+            return metadata.requiresHEVCRetag ? Compatibility(label: "HEVC", retagHEVC: true, duration: metadata.duration) : nil
+        } catch {
+            try Task.checkCancellation()
+            return nil
         }
-        var prefix = Data()
-        for try await byte in bytes {
-            prefix.append(byte)
-            if prefix.count == count { break }
-        }
-        return prefix
+    }
+
+    /// 供调用方仅判断是否需要兼容播放；播放启动可复用完整探测结果，避免重复网络请求。
+    static func needsRemux(_ channel: TVChannel, session: URLSession = .shared) async throws -> Bool {
+        try await compatibility(channel, session: session) != nil
     }
 
     /// EBML 文件头用于识别 Matroska，包括被错误命名为 MP4 的资源。
@@ -122,7 +128,7 @@ final class MediaRemuxSession {
     }
 
     /// 启动有限缓存的流式转封装，首个分片就绪即可播放，无需先下载整部影片。
-    static func start(channel: TVChannel, startTime: Double = 0, sourceDuration: Double? = nil) async throws -> MediaRemuxSession {
+    static func start(channel: TVChannel, startTime: Double = 0, sourceDuration: Double? = nil, compatibility: Compatibility? = nil) async throws -> MediaRemuxSession {
         guard startTime.isFinite, startTime >= 0 else {
             throw SourceParseError.invalidInput("播放位置无效，请重新选择进度。")
         }
@@ -130,7 +136,7 @@ final class MediaRemuxSession {
         let runtime = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/TVBoxMacOS/runtime/media/ffmpeg")
         guard let executable = [bundled, runtime].compactMap({ $0 }).first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
-            throw SourceParseError.invalidInput("此资源实际为 MKV，缺少兼容播放组件。请重新安装包含该组件的应用版本。")
+            throw SourceParseError.invalidInput("此资源需要兼容播放组件。请重新安装包含该组件的应用版本。")
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tvbox-media-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -145,33 +151,42 @@ final class MediaRemuxSession {
             let headers = playbackHTTPHeaders(overrides: channel.headers).filter {
                 !$0.key.contains("\r") && !$0.key.contains("\n") && !$0.value.contains("\r") && !$0.value.contains("\n")
             }.map { "\($0.key): \($0.value)\r\n" }.sorted().joined()
-            let prefix = try await readPrefix(channel, count: 65_536)
+            let detected: Compatibility?
+            if let compatibility { detected = compatibility }
+            else { detected = try await Self.compatibility(channel) }
             try Task.checkCancellation()
-            let duration = sourceDuration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? matroskaDuration(in: prefix)
-            let videoTag = prefix.range(of: Data("V_MPEGH/ISO/HEVC".utf8)) != nil ? ["-tag:v", "hvc1"] : []
-            // 输入定位允许跳到尚未缓存的位置；新 HLS 的时间轴始终从零开始，由播放器叠加原片偏移。
-            let seekArguments = startTime > 0 ? ["-ss", String(startTime)] : []
-            process.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin",
+            let duration = sourceDuration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? detected?.duration
+            let videoTag = detected?.retagHEVC == true ? ["-tag:v", "hvc1"] : []
+            // 视频复制会保留前关键帧；音频也必须保留同一段，不能仅精确裁剪重编码的音轨。
+            // copyts 的源时间戳写入 init.mp4 edit list，用于恢复原片时间轴。
+            let seekArguments = startTime > 0 ? ["-ss", String(startTime), "-noaccurate_seek"] : []
+            process.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin", "-copyts", "-start_at_zero",
                 "-rw_timeout", "15000000", "-protocol_whitelist", "http,https,tcp,tls,crypto",
                 "-headers", headers, "-readrate", "1", "-readrate_initial_burst", "12"] + seekArguments + ["-i", channel.streamURL.absoluteString,
                 "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "copy"] + videoTag + [
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-avoid_negative_ts", "make_zero", "-f", "hls", "-hls_time", "4",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-avoid_negative_ts", "disabled", "-f", "hls", "-hls_time", "4",
                 "-hls_segment_type", "fmp4", "-hls_list_size", "120", "-hls_delete_threshold", "2",
                 "-hls_flags", "delete_segments+temp_file", "-hls_segment_filename", "segment-%06d.m4s", "index.m3u8"]
             // 不持久化 FFmpeg 原始错误文本，其中可能包含签名 URL 或 Cookie。
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try process.run()
-            let created = MediaRemuxSession(playbackURL: baseURL.appendingPathComponent("index.m3u8"), sourceDuration: duration, startTime: startTime, process: process, server: server, directory: directory)
+            let created = MediaRemuxSession(playbackURL: baseURL.appendingPathComponent("index.m3u8"), sourceDuration: duration, startTime: startTime, compatibility: detected, process: process, server: server, directory: directory)
             session = created
             let deadline = Date().addingTimeInterval(40)
             while Date() < deadline {
                 try Task.checkCancellation()
                 if let playlist = try? String(contentsOf: directory.appendingPathComponent("index.m3u8"), encoding: .utf8), playlist.contains("#EXTINF:") {
+                    let initialization = try Data(contentsOf: directory.appendingPathComponent("init.mp4"))
+                    guard let normalized = RemuxTimeline.normalizedInitialization(initialization), normalized.offset.isFinite, normalized.offset >= 0 else {
+                        throw SourceParseError.invalidInput("无法读取兼容媒体的同步时间轴，请切换线路。")
+                    }
+                    try normalized.data.write(to: directory.appendingPathComponent("init.mp4"), options: .atomic)
+                    created.timelineOffset = normalized.offset
                     return created
                 }
                 guard process.isRunning else {
-                    throw SourceParseError.invalidInput("MKV 兼容播放准备失败（退出码 \(process.terminationStatus)），请切换其他线路或画质。")
+                    throw SourceParseError.invalidInput("兼容播放准备失败（退出码 \(process.terminationStatus)），请切换其他线路或画质。")
                 }
                 try await Task.sleep(nanoseconds: 200_000_000)
             }
@@ -187,7 +202,11 @@ final class MediaRemuxSession {
     var failureExitCode: Int32? { !process.isRunning && process.terminationStatus != 0 ? process.terminationStatus : nil }
 
     /// 换集、停止和退出时终止转封装，并清除本次播放缓存。
-    func stop() { Self.cleanup(process: process, server: server, directory: directory) }
+    func stop() {
+        guard !isStopped else { return }
+        isStopped = true
+        Self.cleanup(process: process, server: server, directory: directory)
+    }
 
     /// 进程只写本次临时分片；立即终止可避免应用退出后残留后台下载。
     nonisolated private static func cleanup(process: Process, server: LocalMediaHTTPServer, directory: URL) {
@@ -195,6 +214,8 @@ final class MediaRemuxSession {
         if process.isRunning {
             process.terminationHandler = { _ in try? FileManager.default.removeItem(at: directory) }
             kill(process.processIdentifier, SIGKILL)
+            // 等进程退出后仅清理一次，避免 stop/deinit/terminationHandler 竞争删除目录。
+            return
         }
         try? FileManager.default.removeItem(at: directory)
     }

@@ -138,7 +138,8 @@ final class SourceAdapterTests: XCTestCase {
         let site = TVBoxSite(key: "ik", name: "IK", api: URL(string: "https://example.com/api.php")!)
         let response = Data("{\"list\":[{\"vod_id\":123,\"vod_name\":\"Movie\",\"vod_play_url\":\"正片$https://example.com/movie.m3u8\"}]}".utf8)
         let result = try TVBoxSearchParser.parse(data: response, site: site)
-        XCTAssertEqual(result.first?.id, "https://example.com/api.php|ik|123")
+        XCTAssertEqual(result.first?.vodID, "123")
+        XCTAssertEqual(result.first?.legacyID, "https://example.com/api.php|ik|123")
         XCTAssertEqual(result.first?.playSources.count, 1)
     }
 

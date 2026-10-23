@@ -2,16 +2,18 @@
 
 A personal, local-first macOS player for user-provided IPTV/M3U and TVBox/影视仓 JSON sources.
 
-## MVP scope
+## Current scope
 
-- Import a source from an HTTPS URL or local file
-- Parse IPTV extended M3U live channels
-- Parse the static `lives` section from TVBox/影视仓 JSON
-- Search, group, favorite and play channels
-- Keep the last known good snapshot locally
-- Play HLS/HTTP streams with AVPlayer
+- Import remote or local M3U/TVBox JSON; distinguish IPTV channel lists from HLS media playlists.
+- Browse, search, favorite and play live channels; reimport preserves existing channel/favorite IDs.
+- Search configured CMS and CatVod `csp_*` Spider sites, including ordinary (`quickSearch=0`) search.
+- Resolve Spider detail/player responses through an authenticated Android Bridge on loopback.
+- Show native Quark/Baidu QR login and store client credentials in macOS Keychain.
+- Play direct media with AVPlayer, use bundled FFmpeg for Matroska, and open actual HTML playback pages in WebKit.
 
-The MVP deliberately does not execute remote Spider JAR, JavaScript, Python, WebView click scripts or arbitrary parser code.
+The app executes user-configured Android Spider packages inside its dedicated emulator.
+Arbitrary JavaScript/Python adapters and Spider responses requiring external parsers (`parse`, `jx`, `playUrl`) remain unsupported.
+Only add sources you trust; the emulator is a compatibility runtime, not a guarantee that remote packages are safe.
 
 ## Build
 
@@ -34,22 +36,35 @@ It is not bundled into the app, and credentials or signed URLs must not be commi
 
 ## Architecture
 
-- `Domain.swift`: canonical source and channel models
-- `SourceAdapters.swift`: bounded M3U and static TVBox JSON adapters
-- `Playback.swift`: AVPlayer seam
-- `TVBoxMacOSApp.swift`: SwiftUI shell
+- `Domain.swift`, `SourceAdapters.swift`, `SourceStore.swift`: models, parsing and last successful local snapshots.
+- `SourceLoader.swift`, `SearchPipeline.swift`: catalog/CMS/Spider requests and independently bounded catalog, CMS and Spider scheduling. Results stream in; cancelling keeps completed results. CMS summaries load detail on selection.
+- `SpiderService.swift`: one app-owned service shared across windows; cancellable callers reuse a single startup operation and continuous health monitoring.
+- `Bridge/`: Android DEX/native compatibility. HTTP health handling is separate from bounded Spider execution; 20-second request deadlines return explicit errors. A task ignoring interruption retains its admission slot until it exits.
+- `Playback.swift`, `MediaProbe.swift`, `MediaCompatibility.swift`: bounded content probing, native playback and Matroska remuxing.
 
-## Packaging
+Bridge packages use immutable SHA-256 content directories. MD5-pinned packages are verified;
+URLs without a pin are revalidated after five minutes on the next request, with revalidation
+deferred during active QR login. Native library paths follow the package content hash.
+The current Bridge still runs packages in one Android process: JNI process crashes and
+multiple permanently blocked packages require restarting that service; full process isolation is not implemented.
+
+## Validation and packaging
 
 ```bash
+swift test
+scripts/test_spider_bridge.sh
 scripts/package_app.sh
 codesign --verify --deep --strict "$HOME/Applications/TVBoxMacOS.app"
 ```
 
-Packaging replaces the single app at `~/Applications/TVBoxMacOS.app`; custom output
-directories are no longer accepted. Temporary staging is cleaned up automatically.
-Do not retain additional `.app` copies in release or backup directories. If a ZIP is
-needed, replace `dist/TVBoxMacOS-macOS-arm64.zip` instead of creating dated copies.
+Packaging requires the Android/JDK runtime from `scripts/setup_spider_runtime.sh`, rebuilds
+the Bridge APK and embeds it with the app so an older runtime APK cannot hide Java fixes.
+It replaces the single app at `~/Applications/TVBoxMacOS.app`; custom output directories
+are no longer accepted. Temporary staging is cleaned up automatically; do not retain
+additional `.app` copies in release or backup directories. If a ZIP is needed, replace
+`dist/TVBoxMacOS-macOS-arm64.zip` instead of creating dated copies.
+It uses ad-hoc signing. CI runs Swift tests and a separate JDK 17/Android 35 Bridge build/test job.
+Live provider search, detail, media decoding and phone scan confirmation are separate acceptance checks.
 
 ## macOS playback compatibility
 
@@ -58,8 +73,8 @@ the video. The bottom control bar includes seeking, fullscreen, volume, and mute
 Return opens a separate black fullscreen window sharing the same AVPlayer; Escape
 returns to the embedded player without restarting playback.
 
-Some Spider resources named `.mp4` actually contain Matroska. The app checks the
-media header and streams those resources through a bundled FFmpeg 7.1 process:
+Some Spider resources named `.mp4` actually contain Matroska. The app probes the
+media header, including public CDN URLs, and streams those resources through a bundled FFmpeg 7.1 process:
 video is copied, audio is converted to AAC, and a loopback-only HTTP server serves
 fragmented MP4/HLS. This path keeps 120 recent segments (roughly 8–12 minutes);
 the progress bar uses the original file duration, with buffered ranges shown
